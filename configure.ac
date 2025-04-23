@@ -5,12 +5,14 @@ AC_PREREQ(2.59)
 AC_INIT(Shore-Storage-Manager, 7.0.0, Noone._Sadly-_this_is_unsupported_software.)
 AC_CONFIG_HEADERS([config/shore-config.h:config/shore-config-h.in])
 AC_CONFIG_SRCDIR([config/shore.def])
+RLIBV2_DIR="${srcdir}/rlibv2"
+RLIBV2_CORE_INCLUDE="-I${RLIBV2_DIR}/core"
 AC_COPYRIGHT(COPYRIGHT-NOTICE)
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_MACRO_DIR([m4])
 
 # clobber the annoying '-g -O2' automake likes to insert
-CXXFLAGS=
+CXXFLAGS="-std=c++17"
 
 echo configure args: $* > tmpcfg.txt
 
@@ -21,7 +23,9 @@ echo configure args: $* > tmpcfg.txt
 ## 'foreign' says that we don't follow all GNU standards
 ## For some reason, dependency tracking is not enabled by default
 ## on our Solaris box.
-AM_INIT_AUTOMAKE([-Wall -Werror foreign])
+AM_INIT_AUTOMAKE([-Wall -Werror foreign subdir-objects])
+RLIBV2_C_WRAPPERS_INCLUDE="-I${RLIBV2_DIR}/c_wrappers"
+AM_CPPFLAGS="$AM_CPPFLAGS -I${RLIBV2_CORE_INCLUDE} ${RLIBV2_C_WRAPPERS_INCLUDE} -I/usr/include/gflags"
 
 ## This package uses an assembler.
 ## Define CCAS and CCASFLAGS 
@@ -284,8 +288,6 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM(
 AC_LANG_POP(C++)
 
 ## AC_PROG_INSTALL 
-
-AC_PROG_RANLIB 
 
 AC_PATH_PROG([PERL], [perl], [],[]) 
 
@@ -1006,6 +1008,21 @@ AH_VERBATIM([W_LARGEFILE],[#if (defined(_LARGEFILE_SOURCE) && defined(_FILE_OFFS
 
 # -------------------------------------------------------------------------
 #
+# Check for Rlibv2 dependencies
+#
+# -------------------------------------------------------------------------
+
+AC_LANG([C++])
+AC_CHECK_HEADERS([gflags/gflags.h], [], [AC_MSG_ERROR([gflags header not found])])
+PKG_CHECK_MODULES([GFLAGS], [gflags], [], [AC_MSG_ERROR([gflags library not found])])
+
+# Pthreads should be handled by AX_PTHREAD later in the file
+
+AC_CHECK_HEADERS([infiniband/verbs.h], [], [AC_CHECK_HEADERS([rdma/verbs.h], [], [AC_MSG_ERROR([ibverbs header not found])])])
+AC_CHECK_LIB([ibverbs], [ibv_open_device], [IBVERBS_LIBS="-libverbs"], [AC_MSG_ERROR([ibverbs library not found])])
+
+# -------------------------------------------------------------------------
+#
 # Posix monotonic clock funcs : clock_gettime
 #  on linux, need this to implement gethrtime() lib func
 # -------------------------------------------------------------------------
@@ -1277,6 +1294,7 @@ fi
 
 AC_SUBST(HAVE_GCC_ATOMIC_BUILTINS)
 
+LT_INIT
 
 AC_CONFIG_FILES([Makefile])
 AC_CONFIG_FILES([config/Makefile])
@@ -1295,6 +1313,8 @@ AC_CONFIG_FILES([src/sthread/tests/Makefile])
 AC_CONFIG_FILES([src/common/Makefile])
 AC_CONFIG_FILES([src/common/tests/Makefile])
 
+AC_CONFIG_FILES([rlibv2/Makefile])
+AC_CONFIG_FILES([rdma_server/Makefile])
 AC_CONFIG_FILES([src/sm/Makefile])
 AC_CONFIG_FILES([src/sm/tests/Makefile])
 AC_CONFIG_FILES([src/sm/smsh/Makefile])

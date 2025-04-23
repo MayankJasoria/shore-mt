@@ -42,6 +42,9 @@ smsh_SOURCES      =  \
 
 LDADD      = \
 	$(top_builddir)/src/sm/libsm.a \
+	$(GFLAGS_LIBS) \
+	$(IBVERBS_LIBS) \
+    $(PTHREAD_LIBS) \
 	$(top_builddir)/src/common/libcommon.a  \
 	$(top_builddir)/src/sthread/libsthread.a  \
 	$(top_builddir)/src/fc/libfc.a  \

@@ -7,7 +7,12 @@ EXTRA_DIST = e_error.dat\
 
 AM_CXXFLAGS          += -I$(top_srcdir)/src/fc \
 		       -I$(top_srcdir)/src/sthread \
-		       -I$(top_srcdir)/src/common 
+		       -I$(top_srcdir)/src/common \
+		       -I$(srcdir)/rdma_integration \
+               -I$(top_srcdir)/rlibv2/c_wrappers \
+               -I$(top_srcdir)/rlibv2/core
+
+AM_CFLAGS += -I$(top_srcdir)/rlibv2/c_wrappers -I$(srcdir)/rdma_integration
 
 lib_LIBRARIES     = libsm.a
 
@@ -99,7 +104,10 @@ include_HEADERS = \
 	sysdefs.h \
 	vol.h \
 	xct.h xct_dependent.h \
-	zkeyed.h 
+	zkeyed.h \
+	rdma_integration/rdma_integration.h \
+    rdma_integration/rdma_structs.h \
+    rdma_integration/c_list.h
 
 libsm_a_SOURCES      =  \
 	bf.cpp bf_core.cpp \
@@ -140,7 +148,13 @@ libsm_a_SOURCES      =  \
 	xct.cpp \
 	vtable_sm.cpp \
 	vtable_smthread.cpp \
-	vtable_xct.cpp
+	vtable_xct.cpp \
+	rdma_integration/c_list.cpp \
+    rdma_integration/hashmap.c \
+    rdma_integration/lsn_t_c.cpp \
+	rdma_integration/rdma_integration.c
+
+libsm_a_LIBADD = $(LOCALLDADD)
 
 MOSTLYCLEANFILES = $(GENFILES) e_error.timestamp logdef.timestamp \
 	sm_stats.timestamp

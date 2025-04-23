@@ -1,3 +1,5 @@
+ACLOCAL_AMFLAGS = -I m4
+
 ## Process this file with automake to produce Makefile.in
 ##  Trouble with 'make install' makes me put all the installed stuff here:
 ## and let user copy that wherever he chooses.`
@@ -8,7 +10,7 @@ MAINTAINERCLEANFILES = \
 	$(installdir)/bin/* 
 
 CLEANFILES = dox/ warnings
-SUBDIRS = src config 
+SUBDIRS = config rlibv2 src rdma_server
 DIST_SUBDIRS = tools $(SUBDIRS) 
 EXTRA_DIST = bootstrap Makefile.local Makefile.generic COPYRIGHT-NOTICE README ChangeLog Makefile.in gethugepagesize.sh Doxyfile
 

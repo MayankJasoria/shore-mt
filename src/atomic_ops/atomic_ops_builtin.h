@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <inttypes.h>
+#include <stdint.h>
 // #include <sys/inttypes.h>
 
 #ifdef	__cplusplus

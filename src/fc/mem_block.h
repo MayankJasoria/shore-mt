@@ -183,6 +183,7 @@ struct block_list {
 
     void*        _slow_acquire(size_t chip_size, size_t chip_count, size_t block_size);
     void        _change_blocks(size_t chip_size, size_t chip_count, size_t block_size);
+
     block*        _tail;
     block_pool*        _pool;
     size_t        _hit_count;
