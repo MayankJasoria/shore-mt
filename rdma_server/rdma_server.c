@@ -1656,7 +1656,7 @@ int main(int argc, char* argv[]) {
   }
 
   // TODO: Fix directory path
-  if (list_directory_contents("shore_wal") != 0) {
+  if (list_directory_contents("shore-wal") != 0) {
     perror("Failed to perform directory read and send\n");
     destroyQueue(commandsQueue);
     destroyWriteQueue(writeQueue);

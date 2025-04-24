@@ -20,9 +20,9 @@
 #include "rdmaio_qp_c.h"
 /* RDMA IMPORTS END */
 
-#define MAX_FILE_NAME_SIZE 64 // WAL file names are likely to be "shore_log/" + 15 (log) - 53 (master) characters, + null-terminator
+#define MAX_FILE_NAME_SIZE 256 // WAL file names are likely to be "shore_log/" + 15 (log) - 53 (master) characters, + null-terminator
 #define MAX_WRITE_MESSAGE_SIZE (RDMA_MAX_MSG_SIZE - sizeof(off_t) - sizeof(size_t) - 2 * sizeof(int))
-#define MAX_READ_MESSAGE_SIZE 1024 - sizeof(unsigned int) - 2 * sizeof(int) - sizeof(size_t) - sizeof(off_t) - sizeof(bool)
+#define MAX_READ_MESSAGE_SIZE 1024 * 512 - sizeof(unsigned int) - 2 * sizeof(int) - sizeof(size_t) - sizeof(off_t) - sizeof(bool)
 
 /* flags relevant for RDMA setup */
 #define RDMA_SERVER_ADDR "192.168.252.211:8888"
@@ -41,7 +41,7 @@
 #define RDMA_ENTRY_SIZE 2048
 #define RDMA_ACK_BUFFER_SIZE (RDMA_ENTRY_SIZE * (sizeof(int) * 2 + sizeof(struct stat)))
 #define RDMA_WRITE_ACK_BUFFER_SIZE (RDMA_ENTRY_SIZE * (sizeof(uint64_t) + sizeof(int)))
-#define RDMA_READ_ACK_BUFFER_SIZE (RDMA_ENTRY_SIZE * MAX_READ_MESSAGE_SIZE)
+#define RDMA_READ_ACK_BUFFER_SIZE (RDMA_ENTRY_SIZE * 1024 * 512)
 #define RDMA_CLIENT_QP_NAME "send_qp"
 #define RDMA_SERVER_QP_NAME "recv_qp"
 #define RDMA_WRITE_ACK_QP_NAME "write_ack_qp"
