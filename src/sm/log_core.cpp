@@ -71,6 +71,8 @@ Rome Research Laboratory Contract No. F30602-97-2-0247.
 #include <sys/stat.h>
 #include <os_interface.h>
 #include <largefile_aware.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "sm_int_1.h"
 #include "logtype_gen.h"
@@ -89,6 +91,10 @@ Rome Research Laboratory Contract No. F30602-97-2-0247.
 
 #include <map>
 #include <math.h>
+
+// RDMA operations
+#include "rdma_integration.h"
+#include "c_list.h"
 
 bool       log_core::_initialized = false;
 
@@ -293,25 +299,26 @@ log_core::scavenge(lsn_t min_rec_lsn, lsn_t min_xct_lsn)
 
 /*********************************************************************
  *
- *  log_core::_flush(start_lsn, start1, end1, start2, end2)
- *  @param[in] start_lsn    starting lsn: tells us destination file 
- *  @param[in] start1 
- *  @param[in] end1 
- *  @param[in] start2 
- *  @param[in] end2 
+ * log_core::_flushX(start_lsn, end_lsn, start1, end1, start2, end2)
+ * @param[in] start_lsn    starting lsn of the data being flushed
+ * @param[in] end_lsn      lsn of the first byte AFTER the data being flushed (skip record LSN)
+ * @param[in] start1
+ * @param[in] end1
+ * @param[in] start2
+ * @param[in] end2
  *
- *  helper for flush_daemon_work
+ * helper for flush_daemon_work - Flushes log buffer segments to disk.
  *
- *
+ * Modified to use the RDMA-ported partition_t::flush and handle new partitions.
  *********************************************************************/
 void
-log_core::_flushX(lsn_t start_lsn, 
+log_core::_flushX(lsn_t start_lsn, lsn_t end_lsn,
         long start1, long end1, long start2, long end2)
 {
     // time to open a new partition? (used to be in log_core::insert,
     // now called by log flush daemon)
     // This will open a new file when the given start_lsn has a
-    // different file() portion from the current partition()'s 
+    // different file() portion from the current partition()'s
     // partition number, so the start_lsn is the clue.
     partition_t* p = curr_partition();
     if(start_lsn.file() != p->num()) {
@@ -331,10 +338,12 @@ log_core::_flushX(lsn_t start_lsn,
             smlevel_1::chkpt->wakeup_and_take();
             u_int oldest = log->global_min_lsn().hi();
             if(oldest + PARTITION_COUNT == start_lsn.file()) {
-            fprintf(stderr, "Can't open partition %d until partition %d is reclaimed\n",
-                start_lsn.file(), oldest);
-            DO_PTHREAD(pthread_cond_wait(&_scavenge_cond, &_scavenge_lock));
-            goto retry;
+                // If the partition we need to open is still within the range of partitions in use,
+                // wait for scavenging to free up space.
+                fprintf(stderr, "Can't open partition %d until partition %d is reclaimed\n",
+                    start_lsn.file(), oldest);
+                DO_PTHREAD(pthread_cond_wait(&_scavenge_cond, &_scavenge_lock)); // Wait for scavenge signal
+                goto retry; // Retry checking after waking up
             }
             DO_PTHREAD(pthread_mutex_unlock(&_scavenge_lock));
             
@@ -342,7 +351,7 @@ log_core::_flushX(lsn_t start_lsn,
             CRITICAL_SECTION(cs, _partition_lock);
             p->close();  
             unset_current();
-            DBG(<<" about to open " << n+1);
+            DBG(<<" about to open " << n+1 << "for append");
             //                                  end_hint, existing, recovery
             p = _open_partition_for_append(n+1, lsn_t::null, false, false);
         }
@@ -352,14 +361,23 @@ log_core::_flushX(lsn_t start_lsn,
         w_assert3(partition_num() != 0);
     }
 
-    // Flush the log buffer
-    p->flush(p->fhdl_app(), start_lsn, _buf, start1, end1, start2, end2);
-    long written = (end2 - start2) + (end1 - start1);
-    p->set_size(start_lsn.lo()+written);
+    // Flush the log buffer segments to the file for this partition.
+    // This is the key call to the RDMA-ported partition_t::flush function.
+    // Use the partition's append file handle (p->fhdl_app()).
+    // Pass the END LSN (end_lsn) as the second parameter, as this is the LSN
+    // that partition_t::flush uses for the skip record and isRdmaFlushCompleted.
+    // Pass the log buffer base pointer (_buf).
+    // Pass the buffer segment offsets (start1, end1, start2, end2).
+    p->flush(p->fhdl_app(), end_lsn, _buf, start1, end1, start2, end2); // Call the ported partition_t::flush overload
+
+    // Update the logical size of the partition object.
+    long written = (end2 - start2) + (end1 - start1); // Calculate the total data bytes written
+    // The new size is the original start_lsn.lo() offset plus the total bytes written.
+    p->set_size(start_lsn.lo()+written); // Update partition object's logical size
 
 #if W_DEBUG_LEVEL > 2
     _sanity_check();
-#endif 
+#endif
 }
 
 
@@ -415,34 +433,81 @@ log_core::_prime(int fd, fileoff_t start, lsn_t next)
 // uses this to prime its own buffer for writing a skip record.
 // It is called from the private _prime to prime the segment-sized
 // log buffer _buf.
-long                 
+long
 log_core::prime(char* buf, int fd, fileoff_t start, lsn_t next)
 {
     FUNC(log_core::prime);
 
+    // This assertion is likely still valid even with RDMA, assuming
+    // partitions are treated as starting at offset 0 within the file.
     w_assert1(start == 0); // unless we are on a raw device, which is
     // no longer supported for the log.
 
+    // Calculate the starting offset of the block containing 'next'.
     fileoff_t b = _floor(next.lo(), BLOCK_SIZE);
     // get the first lsn in the block to which "next" belongs.
     lsn_t first = lsn_t(uint4_t(next.hi()), sm_diskaddr_t(b));
 
-    // if the "next" lsn is in the middle of a block...
+    // If the "next" lsn is not at the beginning of a block,
+    // we need to read the block it is contained in.
     if(first != next) {
         w_assert3(first.lo() < next.lo());
-        fileoff_t offset = start + first.lo();
+        // The offset in the file where this block starts.
+        // Since start is asserted to be 0, this is just b.
+        fileoff_t read_offset = start + first.lo(); // Effectively just b
 
-        DBG(<<" reading " << int(BLOCK_SIZE) << " on fd " << fd );
-        int n = 0;
-        w_rc_t e = me()->pread(fd, buf, BLOCK_SIZE, offset);
-        if (e.is_error()) {
-            // Not mt-safe, but it's a fatal error anyway
-            W_FATAL_MSG(e.err_num(), 
-                        << "cannot read log: lsn " << first 
-                        << "pread(): " << e 
-                        << "pread() returns " << n << endl);
+        DBG(<<" reading " << int(BLOCK_SIZE) << " bytes on fd " << fd << " at offset " << read_offset );
+
+        // --- Start Modification: Replace me()->pread with rdmaWalRead ---
+        // The original code was:
+        // int n = 0; // n was initialized to 0, used in error message
+        // w_rc_t e = me()->pread(fd, buf, BLOCK_SIZE, offset); // uses offset, should be read_offset
+        // if (e.is_error()) { ... W_FATAL_MSG(e.err_num(), << "pread() returns " << n) ... }
+
+        ssize_t bytes_read = rdmaWalRead((unsigned int)fd, read_offset, BLOCK_SIZE, buf); // Use rdmaWalRead
+
+        // Check the return value of rdmaWalRead (ssize_t)
+        // We expect to read a full BLOCK_SIZE here.
+        if (bytes_read != (ssize_t)BLOCK_SIZE) {
+            // Read failed (-1) or was a short read (0 <= bytes_read < BLOCK_SIZE).
+            w_rc_t e = RC(eOS); // Use generic OS error code
+
+            // Craft a more informative error message
+            std::stringstream err_msg;
+            err_msg << "ERROR: rdmaWalRead failed or short read in log_core::prime."
+                    << " File Descriptor: " << fd
+                    << ", Offset: " << read_offset
+                    << ", Requested Size: " << BLOCK_SIZE
+                    << ", Bytes Read: " << bytes_read;
+
+            if (bytes_read < 0) { // Explicit error return from rdmaWalRead
+                // errno should be set by rdmaWalRead on -1 return
+                err_msg << ". System Error: " << strerror(errno);
+                // Use the error number from errno if available, or a generic one.
+                // Original code used e.err_num(), let's try to map errno if possible, or use eOS.
+                e = RC_AUGMENT(e); // Augment the error code with errno
+            } else { // Short read (0 <= bytes_read < BLOCK_SIZE)
+                // Short reads for full blocks are typically unexpected and indicate a problem.
+                e = RC_AUGMENT(e); // Treat as I/O error
+            }
+
+            smlevel_0::errlog->clog << fatal_prio << err_msg.str() << endl << e << flushl;
+            W_FATAL(e.err_num()); // Use the augmented error number
         }
+        // --- End Modification: Replace me()->pread ---
+
+    } else { // first == next (the next lsn is at the beginning of a block)
+        // No read is necessary, the buffer should already be empty or zeroed.
+        // Ensure the buffer is zeroed in this case for consistency, although
+        // the memorymove below might handle it if boffset is 0.
+        // Let's explicitly zero just the block if no read happens.
+        // This prevents stale data from previous reads or uninitialized buffer.
+        memset(buf, 0, BLOCK_SIZE);
     }
+
+    // The size of the partial block ending at 'next'.
+    // This is the number of bytes from the start of the block (offset b)
+    // up to the offset of 'next' within the file.
     return next.lo() - first.lo();
 }
 
@@ -1160,25 +1225,50 @@ log_core::log_core(
     // don't want to trip the assertions that watch for it.
     CRITICAL_SECTION(cs, _partition_lock);
 
+
+    if(!rdmaContextCreate()) {
+      //error
+      smlevel_0::errlog->clog << fatal_prio
+      	    << "Error: Could not create RDMA context" <<flushl;
+        W_FATAL(eINTERNAL);
+    }
+
+    rdmaInitMessage("Test message");
+
+	bool error = false;
+    c_list_handle list = rdmaGetDirContentsList(&error);
+
+    if (error) {
+        w_rc_t e = RC(eOS);
+        smlevel_0::errlog->clog << fatal_prio
+      	    << "Error: Could not retrieve files from the log directory " << dir_name() <<flushl;
+        smlevel_0::errlog->clog << fatal_prio
+            << "\tNote: the log directory is specified using\n"
+            "\t      the sm_logdir option." << flushl;
+        W_COERCE(e);
+    }
+
     partition_number_t  last_partition = partition_num();
     bool                last_partition_exists = false;
-    /* 
+    /*
      * make sure there's room for the log names
      */
     fileoff_t eof= fileoff_t(0);
 
-    os_dirent_t *dd=0;
-    os_dir_t ldir = os_opendir(dir_name());
-    if (! ldir) 
-    {
-        w_rc_t e = RC(eOS);
-        smlevel_0::errlog->clog << fatal_prio
-            << "Error: could not open the log directory " << dir_name() <<flushl;
-        smlevel_0::errlog->clog << fatal_prio 
-            << "\tNote: the log directory is specified using\n" 
-            "\t      the sm_logdir option." << flushl;
-        W_COERCE(e);
-    }
+//    os_dirent_t *dd=0;
+//    os_dir_t ldir = os_opendir(dir_name());
+    c_list_iterator_handle iter = c_list_begin(list);
+    c_list_iterator_handle iterEnd = c_list_end(list);
+//    if (! ldir)
+//    {
+//        w_rc_t e = RC(eOS);
+//        smlevel_0::errlog->clog << fatal_prio
+//            << "Error: could not open the log directory " << dir_name() <<flushl;
+//        smlevel_0::errlog->clog << fatal_prio
+//            << "\tNote: the log directory is specified using\n"
+//            "\t      the sm_logdir option." << flushl;
+//        W_COERCE(e);
+//    }
     DBGTHRD(<<"opendir " << dir_name() << " succeeded");
 
     /*
@@ -1220,15 +1310,22 @@ log_core::log_core(
         smlevel_0::errlog->clog << emerg_prio 
             << "Reformatting logs..." << endl;
 
-        while ((dd = os_readdir(ldir)))  
+        while (!c_list_iterator_is_equal(iter, iterEnd)) // ((dd = os_readdir(ldir)))
         {
+            RdmaDirContents contents;
+            if (c_list_iterator_get_data(iter, &contents) != 0) {
+            	smlevel_0::errlog->clog << fatal_prio
+              		<< "Error: Reformatting log failed - failed to retrieve log file name from list" << endl;
+            	W_FATAL(eINTERNAL);
+            }
             DBGTHRD(<<"master_prefix= " << master_prefix());
 
             unsigned int namelen = strlen(log_prefix());
             namelen = namelen > strlen(master_prefix())? namelen :
                                         strlen(master_prefix());
 
-            const char *d = dd->d_name;
+//            const char *d = dd->d_name;
+            const char *d = contents.name;
             unsigned int orig_namelen = strlen(d);
             namelen = namelen > orig_namelen ? namelen : orig_namelen;
 
@@ -1252,12 +1349,17 @@ log_core::log_core(
                     w_ostrstream s(fname, (int) smlevel_0::max_devname);
                     s << dir_name() << _SLASH << name << ends;
                     w_assert1(s);
-                    if( unlink(fname) < 0) {
+                    RdmaSyscallResponse response = rdmaUnlinkFile(fname, NORMAL);
+//                    if( unlink(fname) < 0) {
+                    if (response.status != 0) {
                         w_rc_t e = RC(fcOS);
                         smlevel_0::errlog->clog << debug_prio 
                             << "unlink(" << fname << "):"
                             << endl << e << endl;
                     }
+
+                    // delete this file from the list
+                    iter = c_list_erase(list, iter);
                 }
             }
         } 
@@ -1271,9 +1373,20 @@ log_core::log_core(
             << " last_partition_exists "  << last_partition_exists
             );
 
-    while ((dd = os_readdir(ldir)))  
+    c_list_destroy_iterator(iter);
+    iter = c_list_begin(list);
+
+//    while ((dd = os_readdir(ldir)))
+    while (!c_list_iterator_is_equal(iter, iterEnd))
     {
-        DBGTHRD(<<"dd->d_name=" << dd->d_name);
+      	RdmaDirContents contents;
+        if (c_list_iterator_get_data(iter, &contents) != 0) {
+            smlevel_0::errlog->clog << fatal_prio
+            	<< "Error: Failed to read file name from list" << endl;
+            W_FATAL(eINTERNAL);;
+        }
+//        DBGTHRD(<<"dd->d_name=" << dd->d_name);
+		DBGTHRD(<<"contents.name=" << contents.name);
 
         // XXX should abort on name too long earlier, or size buffer to fit
         const unsigned int prefix_len = strlen(master_prefix());
@@ -1285,7 +1398,7 @@ log_core::log_core(
         w_auto_delete_array_t<char>  ad_buf(buf);
 
         unsigned int         namelen = prefix_len;
-        const char *         dn = dd->d_name;
+        const char *         dn = contents.name; // dd->d_name;
         unsigned int         orig_namelen = strlen(dn);
 
         namelen = namelen > orig_namelen ? namelen : orig_namelen;
@@ -1321,7 +1434,7 @@ log_core::log_core(
                  */
                 lsn_t tmp1;
                 bool old_style=false;
-                rc_t rc = _read_master(name, prefix_len, 
+                rc_t rc = _read_master(name, prefix_len,
                         tmp, tmp1, lsnlist, listlength,
                         old_style);
                 W_COERCE(rc);
@@ -1341,7 +1454,14 @@ log_core::log_core(
                                       _min_chkpt_rec_lsn,
                                       fname,
                                       smlevel_0::max_devname);
-                    (void) unlink(fname);
+
+                    RdmaSyscallResponse response = rdmaUnlinkFile(fname, NORMAL);
+                    if (response.status != 0) {
+                        smlevel_0::errlog->clog << fatal_prio
+                        	<< "unlink(" << fname << "): failed" << endl;
+                        W_FATAL(eINTERNAL);
+                    }
+                    // (void) unlink(fname);
                 }
                 /*
                  *  Save the new master record
@@ -1400,8 +1520,14 @@ log_core::log_core(
                 << "log_core: cannot parse " << name << flushl;
             W_FATAL(fcINTERNAL);
         }
+        iter = c_list_erase(list, iter); // always remove the first element of the list (clean up list by the end)
     }
-    os_closedir(ldir);
+
+    c_list_destroy_iterator(iter);
+    c_list_destroy_iterator(iterEnd);
+    c_list_destroy(list);
+
+//    os_closedir(ldir); (not needed, already handled in the server)
 
     DBGTHRD(<<"after closedir  " 
             << " last_partition "  << last_partition
@@ -1502,239 +1628,432 @@ log_core::log_core(
     make_log_name(last_partition, fname, smlevel_0::max_devname);
     DBGTHRD(<<" checking " << fname);
 
-    FILE *f =  fopen(fname, "r");
-    DBGTHRD(<<" opened " << fname << " fp " << f << " pos " << pos);
+    // --- Start Modification ---
+    // Use file descriptor (int) instead of FILE*
+//    int fd = open(fname, O_RDONLY); // Open for reading
+    RdmaSyscallResponse openResponse = rdmaOpenFile(fname, O_RDONLY, (S_IRWXU | S_IRWXG | S_IRWXO)); // mode is ignored
+    int fd = (int) openResponse.status;
+    if (fd < 0) {
+      	// error
+        smlevel_0::errlog->clog << fatal_prio
+        	<< "Failed to open file " << fname << flushl;
+        W_FATAL(eINTERNAL);
+    }
+
+    DBGTHRD(<<" opened " << fname << " fd " << fd << " pos " << pos);
 
     fileoff_t start_pos = pos;
 
 #ifndef SM_LOG_UNIX_NO_SKIP_SEEK
     /* If the master checkpoint is in the current partition, seek
-       to its position immediately, instead of scanning from the 
+       to its position immediately, instead of scanning from the
        beginning of the log.   If the current partition doesn't have
        a checkpoint, must read entire paritition until the skip
        record is found. */
 
     const lsn_t &seek_lsn = _master_lsn;
 
-    if (f && seek_lsn.hi() == last_partition) {
-            start_pos = seek_lsn.lo();
+    if (fd != -1 && seek_lsn.hi() == last_partition) { // Check fd != -1 instead of f
+        start_pos = seek_lsn.lo();
 
-            DBG(<<" seeking to start_pos " << start_pos);
-            if (fseek(f, start_pos, SEEK_SET)) {
-                smlevel_0::errlog->clog  << error_prio
-                    << "log read: can't seek to " << start_pos
-                     << " starting log scan at origin"
-                     << endl;
-                start_pos = pos;
-            }
-            else
-                pos = start_pos;
+        DBG(<<" starting position from checkpoint: " << start_pos);
+//        // lseek/fseek not required because the read following this is stateless
+//        RdmaSyscallResponse lseekResponse = rdmaLseekFile(fd, start_pos, SEEK_SET);
+//        if (lseekResponse.status == -1 || lseekResponse.offset == (off_t)-1) {
+//            smlevel_0::errlog->clog  << error_prio
+//                << "log read: can't lseek to " << start_pos
+//                 << " starting log scan at origin"
+//                 << endl;
+//            start_pos = pos; // Reset start_pos if seek fails
+//        }
+//        else
+//            pos = start_pos; // Update pos after successful seek
     }
+
+    pos = start_pos;
 #endif
+    // 'pos' now holds the offset for the upcoming read (either the checkpoint LSN offset or the partition start)
     DBG(<<" pos is now " << pos);
 
-    if (f)  {
+    if (fd != -1) { // Check fd != -1 instead of f
         allocaN<logrec_t::hdr_sz> buf;
+        char* output_buf = static_cast<char*>(static_cast<void*>(buf));
 
-        DBGTHRD(<<"fread " << fname << " sz= " << logrec_t::hdr_sz);
-        int n;
-        while ((n = fread(buf, 1, logrec_t::hdr_sz, f)) 
-                == logrec_t::hdr_sz)  
+        DBGTHRD(<<"read " << fname << " sz= " << logrec_t::hdr_sz);
+        ssize_t n = rdmaWalRead(fd, pos, logrec_t::hdr_sz, static_cast<char*>(output_buf));
+
+        // Loop condition checks if read was successful and reads a full header
+        while (n == (ssize_t) logrec_t::hdr_sz)
         {
+            // store current offset
+            fileoff_t current_header_start_pos = pos;
+
+            // advance offset till end of read (for next read)
+            pos += n;
+
             DBG(<<" pos is now " << pos);
             logrec_t  *l = (logrec_t*) (void*) buf;
 
-            if( l->type() == logrec_t::t_skip) {
-                break;
-            }
+            if (l->type() == logrec_t::t_skip) {
+    			DBGTHRD(<<"Found skip log record at offset " << current_header_start_pos); // pos is after header, n is hdr_sz
+    			// We found a skip record. The valid log ends *before* this record.
+    			// 'pos' is currently after the header. Set pos back to the start of the skip record for truncation.
+   				pos -= n; // Revert pos back to the start of the skip header (pos was pos + n)
+    			break; // Exit the WHILE loop to stop scanning
+			}
 
-            smsize_t len = l->length();
-            DBGTHRD(<<"scanned log rec type=" << int(l->type())
-                    << " length=" << l->length());
+			// --- Get and Check Record Length ---
+			smsize_t len = l->length(); // Total length of the record
+			DBGTHRD(<<"scanned log rec type=" << int(l->type()) << " length=" << len);
 
-            if(len < logrec_t::hdr_sz) {
-                // Must be garbage and we'll have to truncate this
-                // partition to size 0
-                w_assert1(pos == start_pos);
-            } else {
-                w_assert1(len >= logrec_t::hdr_sz);
 
-                DBGTHRD(<<"hdr_sz " << logrec_t::hdr_sz );
-                DBGTHRD(<<"len " << len );
-                // seek to lsn_ck at end of record
-                // Subtract out sizeof(header) because we already
-                // read that (thus we have seeked past it)
-                // Subtract out lsn_t to find beginning of lsn_ck.
-                len -= (logrec_t::hdr_sz + sizeof(lsn_t));
+			// --- Handle Corrupt Header Length (Skip Behavior) vs. Valid Header Length ---
+			// If length is less than header size, it's corruption. If >=, it's a valid length.
+			if (len < logrec_t::hdr_sz) {
+    			// Found a header claiming a length smaller than itself - indicates corruption.
+    			// We treat this as garbage and attempt to skip over it
+    			// by looking for the next header immediately after this corrupt header block.
+    			smlevel_0::errlog->clog << error_prio
+       				<< "Found log rec header with length < hdr_sz at offset "
+                    << current_header_start_pos << ". Treating as garbage and attempting re-sync by skipping." << flushl;
 
-                //NB: this is a RELATIVE seek
-                DBG(<<" pos is now " << pos);
-                DBGTHRD(<<"seek additional +" << len << " for lsn_ck");
-                if (fseek(f, len, SEEK_CUR))  {
-                    if (feof(f))  break;
-                }
-                DBGTHRD(<<"ftell says pos is " << ftell(f));
+    			// 'pos' is currently positioned immediately *after* the corrupt header block ((pos-n) + n).
+    			// To implement the skip-over, the *next* read (at the end of the loop) should start from this position.
+    			// We do NOT adjust 'pos' within this 'if' block. 'pos' is already correct for the skip.
 
-                lsn_t lsn_ck;
-                n = fread(&lsn_ck, 1, sizeof(lsn_ck), f);
-                DBGTHRD(<<"read lsn_ck return #bytes=" << n );
-                if (n != sizeof(lsn_ck))  {
-                    w_rc_t        e = RC(eOS);    
-                    // reached eof
-                    if (! feof(f))  {
-                        smlevel_0::errlog->clog << fatal_prio 
-                        << "ERROR: unexpected log file inconsistency." << flushl;
-                        W_COERCE(e);
-                    }
-                    break;
-                }
-                DBGTHRD(<<"pos = " <<  pos
-                    << " lsn_ck = " <<lsn_ck);
+    			// Execution will continue after this 'if' block.
+    			// We skip the 'else' block below that processes a valid record.
 
-                // make sure log record's lsn matched its position in file
-                if ( (lsn_ck.lo() != pos) ||
-                    (lsn_ck.hi() != (uint4_t) last_partition ) ) {
-                    // found partial log record, end of log is previous record
-                    smlevel_0::errlog->clog << error_prio <<
-        "Found unexpected end of log -- probably due to a previous crash." 
-                    << flushl;
-                    smlevel_0::errlog->clog << error_prio <<
-                    "   Recovery will continue ..." << flushl;
-                    break;
-                }
+			} else { // len >= logrec_t::hdr_sz (Valid header length)
+    			// --- Logic for processing a VALID record ---
+    			// This is the block that replaces the commented-out original 'else' logic.
+    			// Original code asserted len >= logrec_t::hdr_sz here. It's guaranteed by the 'else'.
+   				w_assert1(len >= logrec_t::hdr_sz);
 
-                // remember current position 
-                pos = ftell(f) ;
-            }
+   				DBGTHRD(<<"hdr_sz " << logrec_t::hdr_sz );
+    			DBGTHRD(<<"len " << len );
+
+    			// Calculate the absolute offset for lsn_ck.
+    			// Original code used a relative seek: lseek(fd, seek_len, SEEK_CUR)
+    			// where seek_len = len - (logrec_t::hdr_sz + sizeof(lsn_t))
+   				// This relative seek was from the position *after* reading the header (pos - n + n = pos).
+    			// The absolute offset for lsn_ck is (pos - n) + len - sizeof(lsn_t)
+    			fileoff_t lsn_ck_offset = current_header_start_pos + len - sizeof(lsn_t);
+
+    			DBGTHRD(<<"Calculated lsn_ck_offset: " << lsn_ck_offset);
+
+    			// Declare lsn_ck buffer
+    			lsn_t lsn_ck;
+
+    			// Read the lsn_ck explicitly using rdmaWalRead at its calculated offset
+    			ssize_t n_lsn_ck = rdmaWalRead(fd, lsn_ck_offset, sizeof(lsn_ck), reinterpret_cast<char*>(&lsn_ck));
+    			DBGTHRD(<<"rdmaWalRead for lsn_ck return #bytes=" << n_lsn_ck ); // Debug after the read
+
+    			// Check if lsn_ck read failed or was short (EOF/error)
+    			if (n_lsn_ck != (ssize_t)sizeof(lsn_ck)) { // Check against sizeof(lsn_ck)
+       				DBGTHRD(<<"Failed to read lsn_ck at offset " << lsn_ck_offset << ". Read " << n_lsn_ck << " bytes.");
+        			w_rc_t e = RC(eOS); // Original code used eOS
+        			if (n_lsn_ck < 0) { // Check for read error
+             			smlevel_0::errlog->clog << fatal_prio
+             				<< "ERROR: rdmaWalRead failed fetching lsn_ck at offset " << lsn_ck_offset << ". Return value: " << n_lsn_ck << "." << flushl;
+             			W_FATAL(eINTERNAL); // Or handle error
+        			} else { // n_lsn_ck == 0 -> EOF, or n_lsn_ck > 0 but short
+             			// Reached EOF while trying to read lsn_ck, or got a partial read.
+             			// Treat as end of valid log.
+             			smlevel_0::errlog->clog << error_prio
+             				<< "Reached EOF or got short read fetching lsn_ck at offset " << lsn_ck_offset
+                            << ". Read " << n_lsn_ck << " bytes. Treating as end of valid log." << flushl;
+        			}
+        			// The valid log ends *before* this record. The truncation position is the start of this record's header.
+        			pos = current_header_start_pos; // Set 'pos' back to the start of the current record's header
+        			break; // Exit the WHILE loop
+    			}
+    			DBGTHRD(<<"lsn_ck = " << lsn_ck << " found at offset " << lsn_ck_offset); // Debug after successful read
+
+
+    			// make sure log record's lsn matched its position in file
+    			// The LSN stored in lsn_ck should match the offset where the *header* started (current_header_start_pos).
+    			if ( (lsn_ck.lo() != current_header_start_pos) || // Check against the header's starting position
+        			(lsn_ck.hi() != (uint4_t) last_partition ) ) // Assuming last_partition is correctly uint4_t
+    			{
+        			// LSN check failed - treat as incomplete record at the end of the log
+        			smlevel_0::errlog->clog << error_prio
+                        << "Found unexpected end of log -- probably due to a previous crash. LSN check failed at offset "
+                        << current_header_start_pos << "."
+            			<< " Expected LSN offset: " << current_header_start_pos << " Found LSN: " << lsn_ck << flushl;
+
+        			// The valid end of the log is at the start of this record where the check failed.
+        			pos = current_header_start_pos; // Set 'pos' back to the start of the header
+        			break; // Exit the WHILE loop
+   				}
+
+    			// If LSN check passes, the current record is valid.
+    			// Advance 'pos' to the start of the *next* log record header.
+    			// This next header starts 'len' bytes after the current header's start.
+    			pos = current_header_start_pos + len; // Set 'pos' to the offset for the next header read
+
+			} // else (len >= hdr_sz)
+            n = rdmaWalRead(fd, pos, logrec_t::hdr_sz, output_buf);
+        } // while ((n = read(...)) > 0)
+
+        if (n < 0) { // Check if the loop exited due to a read error
+             w_rc_t e = RC(eOS);
+             smlevel_0::errlog->clog << fatal_prio
+             << "ERROR: read failed during log file scan." << flushl;
+             W_FATAL(eINTERNAL); // Or handle error
         }
-        fclose(f);
+
+
+        rdmaCloseFile(fd); // Close the read file descriptor
+        // --- End Modification ---
+
 
         {
             DBGTHRD(<<"explicit truncating " << fname << " to " << pos);
-            int res = os_truncate(fname, pos );
-            if (res < 0) {
-              w_rc_t e = RC(fcOS);
-                smlevel_0::errlog->clog  << fatal_prio
-                    << "truncate(" << fname << "):" << endl << e << endl;
-                W_COERCE(e);
-            }
+            // Use unlink or os_truncate
+            RdmaSyscallResponse truncResponse = rdmaTruncateFile(fname, pos);
+             if (truncResponse.status < 0) {
+                  w_rc_t e = RC(eOS);
+                  smlevel_0::errlog->clog  << fatal_prio
+                      << "os_truncate(" << fname << ", " << pos << "):" << endl << e << endl;
+                   W_COERCE(e);
+             }
 
             //
             // but we can't just use truncate() --
             // we have to truncate to a size that's a mpl
             // of the page size. First append a skip record
             DBGTHRD(<<"explicit opening  " << fname );
-            f =  fopen(fname, "a");
-            if (!f) {
+
+            // --- Start Modification ---
+            // Use file descriptor for append
+            RdmaSyscallResponse openForAppendResponse = rdmaOpenFile(fname, O_WRONLY | O_APPEND, (S_IRWXU | S_IRWXG | S_IRWXO));
+//            int fd_append = open(fname, O_WRONLY | O_APPEND); // Open in append mode
+            int fd_append = (int) openForAppendResponse.status;
+            if (fd_append == -1) { // Check fd_append != -1 instead of !f
                 w_rc_t e = RC(fcOS);
                 smlevel_0::errlog->clog  << fatal_prio
-                    << "fopen(" << fname << "):" << endl << e << endl;
+                    << "open(" << fname << ", O_WRONLY | O_APPEND):" << endl << e << endl;
                 W_COERCE(e);
             }
-            skip_log *s = new skip_log; // deleted below
-            s->set_lsn_ck( lsn_t(uint4_t(last_partition), sm_diskaddr_t(pos)) );
+            // --- End Modification ---
 
-            DBGTHRD(<<"writing skip_log at pos " << pos << " with lsn "
+            skip_log *s = new skip_log; // deleted below
+            s->set_lsn_ck( lsn_t(uint4_t(last_partition), sm_diskaddr_t(eof)) );
+
+            DBGTHRD(<<"writing skip_log at offset " << eof << " with lsn "
                 << s->get_lsn_ck() 
                 << "and size " << s->length()
                 );
 #ifdef W_TRACE
-            {
-                fileoff_t eof2 = ftell(f);
-                DBGTHRD(<<"eof is now " << eof2);
-            }
+			{
+             	// Use rdmaLseekFile(SEEK_CUR) to get current position from the server.
+             	// In append mode, this should return the current end of file (eof) after truncation.
+            	RdmaSyscallResponse eofResponse = rdmaLseekFile(fd_append, 0, SEEK_CUR);
+            	if (eofResponse.status >= 0) { // Check status for success
+                 	fileoff_t current_pos_debug = eofResponse.offset;
+                	DBGTHRD(<<"Position after open in append mode is " << current_pos_debug); // Should be equal to eof
+            	} else {
+                 	// Log error if rdmaLseekFile fails (probably not fatal for debug)
+                	w_rc_t e = RC(eOS); // Use eOS
+            	    smlevel_0::errlog->clog << error_prio << "rdmaLseekFile(SEEK_CUR) failed for debug after append open: " << endl << e << endl;
+            	    // W_COERCE(e); // Decide if this should be fatal
+            	}
+        	}
 #endif
+            lsn_t skip_lsn_val = s->get_lsn_ck(); // Get the LSN value
+        	lsn_t* skip_lsn_ptr = &skip_lsn_val; // Pass pointer to LSN value
+            size_t skip_size = s->length();
 
-            if ( fwrite(s, s->length(), 1, f) != 1)  {
-                w_rc_t        e = RC(eOS);    
-                smlevel_0::errlog->clog << fatal_prio <<
-                    "   fwrite: can't write skip rec to log ..." << flushl;
-                W_COERCE(e);
-            }
+            ssize_t write_skip_result = rdmaWalWrite(reinterpret_cast<const char*>(s), fd_append, reinterpret_cast<lsn_t_c*>(skip_lsn_ptr), eof, skip_size, true, true);
+
+            // --- Start Modification ---
+            // Check the return value. Full success is writing exactly skip_size bytes.
+        	// Failure is -1 or potentially a short write (< skip_size, >= 0).
+        	if (write_skip_result != (ssize_t)skip_size) {
+            	w_rc_t e = RC(eOS); // Original code used eOS
+            	if (write_skip_result < 0) { // Check for explicit error return
+                 	smlevel_0::errlog->clog << fatal_prio <<
+                    	"   rdmaWalWrite failed writing skip rec to log at offset " << eof << ". Return value: " << write_skip_result << "..." << flushl; // Added return value
+                 	W_COERCE(e); // Handle fatal error
+                 	// Consider returning error code or throwing exception
+             	} else { // Short write occurred (0 <= result < skip_size)
+                 	smlevel_0::errlog->clog << fatal_prio <<
+                    	"   rdmaWalWrite short write for skip rec at offset " << eof << ". Wrote " << write_skip_result << " of " << skip_size << " bytes." << flushl; // Added details
+                 	W_COERCE(e); // Treat short write as fatal error
+             	}
+        	} else {
+             	DBGTHRD(<<"rdmaWalWrite successful for skip rec. Wrote " << write_skip_result << " bytes."); // Debug on success
+        	}
+            // --- End Modification ---
+
 #ifdef W_TRACE
             {
-                fileoff_t eof2 = ftell(f);
-                DBGTHRD(<<"eof is now " << eof2);
+             	// Use rdmaLseekFile(SEEK_CUR) to get current position after writing skip record.
+             	// In append mode, this should return eof + s->length().
+            	RdmaSyscallResponse eofResponse = rdmaLseekFile(fd_append, 0, SEEK_CUR);
+             	if (eofResponse.status >= 0) { // Check status for success
+                    fileoff_t current_pos_debug = eofResponse.offset;
+                	DBGTHRD(<<"Position after skip write is " << current_pos_debug); // Should be eof + skip_size
+            	} else {
+                 	// Log error if rdmaLseekFile fails (probably not fatal for debug)
+                 	w_rc_t e = RC(eOS); // Use eOS
+                 	smlevel_0::errlog->clog << error_prio << "rdmaLseekFile(SEEK_CUR) failed for debug after skip write: " << endl << e << endl;
+                 	// W_COERCE(e); // Decide if this should be fatal
+            	}
             }
 #endif
-            fileoff_t o = pos;
-            o += s->length();
-            o = o % BLOCK_SIZE;
+            // Calculate remaining padding needed for block alignment
+            // Manually track position after skip write
+            fileoff_t current_end_pos_after_skip = eof + skip_size;
+            fileoff_t o = current_end_pos_after_skip % BLOCK_SIZE;
             DBGTHRD(<<"BLOCK_SIZE " << int(BLOCK_SIZE));
             if(o > 0) {
                 o = BLOCK_SIZE - o;
                 char *junk = new char[int(o)]; // delete[] at close scope
                 if (!junk)
-                        W_FATAL(fcOUTOFMEMORY);
+                    W_FATAL(fcOUTOFMEMORY); // Handle out of memory
 #if ZERO_INIT
                 fprintf(stderr, "Clearing before write %d %s\n", __LINE__
                         , __FILE__);
                 memset(junk,'\0', int(o));
 #endif
                 
-                DBGTHRD(<<"writing junk of length " << o);
+                DBGTHRD(<<"writing junk of length " << o << " at offset " << current_end_pos_after_skip);
 #ifdef W_TRACE
-                {
-                    fileoff_t eof2 = ftell(f);
-                    DBGTHRD(<<"eof is now " << eof2);
-                }
+            	{
+                	// Use rdmaLseekFile(SEEK_CUR) to get current position before writing padding.
+                	// In append mode, this should return current_end_pos_after_skip.
+                	RdmaSyscallResponse eofResponse = rdmaLseekFile(fd_append, 0, SEEK_CUR);
+                	if (eofResponse.status >= 0) { // Check status for success
+                    	fileoff_t current_pos_debug = eofResponse.offset;
+                    	DBGTHRD(<<"Position before junk write is " << current_pos_debug); // Should be current_end_pos_after_skip
+                	} else {
+                    	// Log error if rdmaLseekFile fails (probably not fatal for debug)
+                    	w_rc_t e = RC(eOS); // Use eOS
+                    	smlevel_0::errlog->clog << error_prio << "rdmaLseekFile(SEEK_CUR) failed for debug before junk write: " << endl << e << endl;
+                    	// W_COERCE(e); // Decide if this should be fatal
+                	}
+            	}
 #endif
-                int        n = fwrite(junk, int(o), 1, f);
-                if ( n != 1)  {
-                    w_rc_t e = RC(eOS);        
-                    smlevel_0::errlog->clog << fatal_prio <<
-                    "   fwrite: can't round out log block size ..." << flushl;
-                    W_COERCE(e);
-                }
-#ifdef W_TRACE
-                {
-                    fileoff_t eof2 = ftell(f);
-                    DBGTHRD(<<"eof is now " << eof2);
-                }
-#endif
-                delete[] junk;
-                o = 0;
-            }
-            delete s; // skip_log
+            	// --- Replace local write with rdmaWalWrite for padding ---
+            	// The write should start at current_end_pos_after_skip.
+            	// For padding, lsn is probably null, start/end false?
+            	size_t padding_size = (size_t)o; // Size of the padding
+            	ssize_t write_junk_result = rdmaWalWrite(junk, fd_append, nullptr, current_end_pos_after_skip, padding_size, false, false); // Use offset, assuming nullptr, false, false
 
-            eof = ftell(f);
-            w_rc_t e = RC(eOS);        /* collect the error in case it is needed */
-            DBGTHRD(<<"eof is now " << eof);
+            	// Check the return value. Full success is writing exactly padding_size bytes.
+            	if (write_junk_result != (ssize_t)padding_size) {
+                	w_rc_t e = RC(eOS); // Original code used eOS
+                 	if (write_junk_result < 0) { // Check for explicit error return
+                    	smlevel_0::errlog->clog << fatal_prio <<
+                    	"   rdmaWalWrite failed writing junk to log at offset " << current_end_pos_after_skip
+                                << ". Return value: " << write_junk_result << "..." << flushl; // Added return value
+                    	W_COERCE(e); // Handle fatal error
+                    	// Consider returning error code or throwing exception
+                	} else { // Short write occurred (0 <= result < padding_size)
+                    	smlevel_0::errlog->clog << fatal_prio <<
+                    	"   rdmaWalWrite short write for junk at offset " << current_end_pos_after_skip << ". Wrote "
+                                << write_junk_result << " of " << padding_size << " bytes." << flushl; // Added details
+                    	W_COERCE(e); // Treat short write as fatal error
+                	}
+            	} else {
+                 	DBGTHRD(<<"rdmaWalWrite successful for junk. Wrote " << write_junk_result << " bytes."); // Debug on success
+            	}
 
+            	delete[] junk;
+            	// o = 0; // Original line - likely just resetting padding length variable. Can remove.
+        	}
+        	delete s; // skip_log
 
-            if(((eof) % BLOCK_SIZE) != 0) {
-                smlevel_0::errlog->clog << fatal_prio <<
-                    "   ftell: can't write skip rec to log ..." << flushl;
-                W_COERCE(e);
-            }
-            W_IGNORE(e);        /* error not used */
-            
-            if (os_fsync(fileno(f)) < 0) {
-                w_rc_t e = RC(eOS);    
-                smlevel_0::errlog->clog << fatal_prio <<
-                    "   fsync: can't sync fsync truncated log ..." << flushl;
-                W_COERCE(e);
-            }
+        	// --- Check final position (equivalent to original ftell check) ---
+        	// The final position should be block aligned. Get the actual final position from the server.
+        	// Update the 'eof' variable that is used later in the constructor.
+        	RdmaSyscallResponse finalEofResponse = rdmaLseekFile(fd_append, 0, SEEK_CUR);
+        	if (finalEofResponse.status >= 0) { // Check status for success
+            	eof = finalEofResponse.offset; // Update the 'eof' variable
+             	DBGTHRD(<<"Final file size (eof) is now " << eof); // Updated debug message
+
+            	if(((eof) % BLOCK_SIZE) != 0) {
+                	w_rc_t e = RC(eOS); // Original code used eOS
+                	smlevel_0::errlog->clog << fatal_prio <<
+                    	"   rdmaLseekFile/rdmaWalWrite: final size not block aligned (size: " << eof << ")..." << flushl; // Updated message
+                	W_COERCE(e); // Handle fatal error
+                 	// Consider returning error code or throwing exception
+            	}
+             	// W_IGNORE(e); // Original ignored error, but we handled it above. Can remove.
+
+        	} else {
+             	// Log fatal error if rdmaLseekFile fails getting final position
+             	w_rc_t e = RC(eOS); // Use eOS
+             	smlevel_0::errlog->clog << fatal_prio << "rdmaLseekFile(SEEK_CUR) failed getting final pos: " << endl << e << endl;
+             	W_COERCE(e); // Handle fatal error
+             	// Consider returning error code or throwing exception
+        	}
+
+        	// --- Replace os_fsync with isRdmaFlushCompleted ---
+        	// The original os_fsync ensures all data written to fd_append is durable.
+        	// With the RDMA layer, the server signals flush completion via LSNs.
+        	// We need to wait for the LSN corresponding to the end of the data we just wrote (the skip record and padding)
+        	// to be flushed. The LSN of the skip record is set to the truncation point 'eof'.
+        	// Assuming waiting for this LSN (which is 'eof') to be flushed is sufficient to guarantee
+        	// the durability of the skip record and padding that were appended starting at 'eof'.
+
+        	// Reconstruct the lsn_t associated with the end of the appended data (the skip record's LSN)
+        	lsn_t skip_record_lsn_for_flush(uint4_t(last_partition), sm_diskaddr_t(eof)); // Use the final 'eof'
+
+        	// Call the C-style wrapper function to check flush completion for this LSN
+        	// isRdmaFlushCompleted takes lsn_t_c*, pass a reinterpret_cast pointer
+        	int fsync_result = isRdmaFlushCompleted(reinterpret_cast<lsn_t_c*>(&skip_record_lsn_for_flush));
+
+        	if (fsync_result < 0) { // Check for error return from isRdmaFlushCompleted (-1 indicates error)
+            	w_rc_t e = RC(eOS); // Original code used eOS
+            	smlevel_0::errlog->clog << fatal_prio <<
+                	"   isRdmaFlushCompleted failed for LSN " << skip_record_lsn_for_flush << "..." << flushl; // Log the LSN
+            	W_COERCE(e); // Handle fatal error
+            	// Consider returning error code or throwing exception
+        	} else {
+             	DBGTHRD(<<"isRdmaFlushCompleted successful for LSN " << skip_record_lsn_for_flush); // Debug on success
+        	}
 
 #if W_DEBUG_LEVEL > 2
-            {
-                w_rc_t e;
-                os_stat_t statbuf;
-                e = MAKERC(os_fstat(fileno(f), &statbuf) == -1, eOS);
-                if (e.is_error()) {
-                    smlevel_0::errlog->clog << fatal_prio 
-                            << " Cannot stat fd " << fileno(f)
-                            << ":" << endl << e << endl << flushl;
-                    W_COERCE(e);
-                }
-                DBGTHRD(<< "size of " << fname << " is " << statbuf.st_size);
-            }
-#endif 
-            fclose(f);
-        }
+        	{
+            	// Replace os_fstat with rdmaFstatCall
+            	// os_fstat is likely a wrapper that takes int fd, already used fileno
+            	w_rc_t e_stat; // Use a different variable name for the stat error
+            	RdmaSyscallResponse statResponse = rdmaFstatCall(fd_append);
+            	e_stat = MAKERC(statResponse.status == -1, eOS); // MAKERC check status field
 
-    } else {
-        w_assert3(!last_partition_exists);
+            	if (e_stat.is_error()) {
+                	smlevel_0::errlog->clog << fatal_prio
+                    	    << " Cannot rdmaFstatCall fd " << fd_append
+                        	<< ":" << endl << e_stat << endl << flushl;
+                	W_COERCE(e_stat); // Handle fatal error
+                 	// Consider returning error code or throwing exception
+            	} else {
+                	// Access the statbuf from the response union
+                	DBGTHRD(<< "size of " << fname << " is " << statResponse.statbuf.st_size << " (from rdmaFstatCall)"); // Updated debug
+            	}
+        	}
+#endif
+        	// --- Replace local close with rdmaCloseFile ---
+        	// close(fd_append); // Original close call
+        	RdmaSyscallResponse closeResponse = rdmaCloseFile(fd_append);
+        	if (closeResponse.status < 0) {
+             	w_rc_t e = RC(eOS); // Use eOS
+             	smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed for fd " << fd_append << endl << e << endl;
+             	W_COERCE(e); // Decide if this should be fatal - likely not fatal but worth logging
+        	} else {
+             	DBGTHRD(<<"rdmaCloseFile successful for fd " << fd_append); // Debug on success
+        	}
+
+        } // if (f) -> now if (fd != -1)
+
+    } else { // if (fd == -1) - File could not be opened for reading
+         w_rc_t e = RC(eOS);
+         smlevel_0::errlog->clog << fatal_prio
+             << "ERROR: could not open log file \"" << fname << "\" for reading." << flushl;
+         W_COERCE(e); // Or handle appropriately if file might legitimately not exist (though original code suggests it should exist if last_partition_exists)
     }
     } // End truncate at last complete log rec
 
@@ -1747,7 +2066,9 @@ log_core::log_core(
         <<" current_lsn " << curr_lsn()
         <<" durable_lsn " << durable_lsn());
 
-    lsn_t new_lsn(last_partition, pos);
+    // The 'pos' variable at this point holds the file offset where the
+    // valid log ends (start of the truncated record).
+    lsn_t new_lsn(last_partition, eof);
     _curr_lsn = _durable_lsn = _flush_lsn = new_lsn;
 
     DBGTHRD( << "partition num = " << partition_num()
@@ -1772,12 +2093,14 @@ log_core::log_core(
                 lasthint = lsnlist[q];
             }
         }
+        // _open_partition_for_append likely uses 'open' and returns a partition_t*
+        // containing the file descriptor(s)
         partition_t *p = _open_partition_for_append(last_partition, lasthint,
                 last_partition_exists, true);
 
         /* XXX error info lost */
         if(!p) {
-            smlevel_0::errlog->clog << fatal_prio 
+            smlevel_0::errlog->clog << fatal_prio
             << "ERROR: could not open log file for partition "
             << last_partition << flushl;
             W_FATAL(eINTERNAL);
@@ -1958,24 +2281,47 @@ log_core::_partition(partition_index_t i) const
 void
 log_core::destroy_file(partition_number_t n, bool pmsg)
 {
+    // Allocate buffer for filename and generate the name.
     char        *fname = new char[smlevel_0::max_devname];
     if (!fname)
-        W_FATAL(fcOUTOFMEMORY);
-    w_auto_delete_array_t<char> ad_fname(fname);
-    make_log_name(n, fname, smlevel_0::max_devname);
-    if (unlink(fname) == -1)  {
-        w_rc_t e = RC(eOS);
+        W_FATAL(fcOUTOFMEMORY); // Handle allocation failure
+    w_auto_delete_array_t<char> ad_fname(fname); // Auto cleanup for filename buffer
+    make_log_name(n, fname, smlevel_0::max_devname); // Generate filename
+
+    // --- Start Modification: Replace unlink with rdmaUnlinkFile ---
+    // The original code was: if (unlink(fname) == -1) { ... }
+    // Use rdmaUnlinkFile to delete the file on the remote machine.
+    // Need to determine the correct OpType for deleting a log partition file.
+    // Assuming a constant like OP_TYPE_LOG_PARTITION_DELETE is defined.
+    // If OpType is not relevant or a simpler overload exists, adjust the call.
+    OpType opType = NORMAL;
+    RdmaSyscallResponse unlinkResponse = rdmaUnlinkFile(fname, opType);
+
+    // Check the status from the response. < 0 indicates an error.
+    if (unlinkResponse.status < 0) { // Check status for error
+    // --- End Modification: Replace unlink with rdmaUnlinkFile ---
+
+        w_rc_t e = RC(smlevel_0::eOS); // Use smlevel_0::eOS for OS error
+
+        // Original code logged the error using error_prio. Adapt log message.
         smlevel_0::errlog->clog  << error_prio
-            << "destroy_file " << n << " " << fname << ":" <<endl
-             << e << endl;
+            << "ERROR: rdmaUnlinkFile failed for partition " << n << " (" << fname << "):"
+            << " Status: " << unlinkResponse.status << "." << endl;
+
+        // Original code printed a separate warning message if pmsg is true.
         if(pmsg) {
-            smlevel_0::errlog->clog << error_prio 
-            << "warning : cannot free log file \"" 
+            smlevel_0::errlog->clog << error_prio
+            << "warning : cannot free log file \""
             << fname << '\"' << flushl;
-            smlevel_0::errlog->clog << error_prio 
+            // Original code printed 'e' here. You can print the w_rc_t.
+            smlevel_0::errlog->clog << error_prio
             << "          " << e << flushl;
         }
+        // Original code did NOT make this function fatal.
+        // It just logged the error/warning and returned (void function).
+        // The caller (partition_t::destroy) handles potential implications.
     }
+    // If unlinkResponse.status >= 0, unlink was successful. Do nothing else.
 }
 
 /**\brief compute size of partition from given max-open-log-bytes size
@@ -2701,7 +3047,7 @@ void log_core::flush_daemon()
  * \return Latest durable lsn resulting from this flush
  *
  */
-lsn_t log_core::flush_daemon_work(lsn_t old_mark) 
+lsn_t log_core::flush_daemon_work(lsn_t old_mark)
 {
     lsn_t base_lsn_before, base_lsn_after;
     long base, start1, end1, start2, end2;
@@ -2713,7 +3059,7 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
 
         // The old_epoch is valid (needs flushing) iff its end > start.
         // The old_epoch is valid id two cases, both when
-        // insert wrapped thelog buffer 
+        // insert wrapped thelog buffer
         // 1) by doing so reached the end of the partition,
         //     In this case, the old epoch might not be an entire
         //     even segment size
@@ -2723,8 +3069,8 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
         if(_old_epoch.start == _old_epoch.end) {
             // no wrap -- flush only the new
             start2 = _cur_epoch.start;
-            end2 = _cur_epoch.end;            
-	    
+            end2 = _cur_epoch.end;
+
 	    // false alarm?
 	    if(start2 == end2)
 		return old_mark;
@@ -2733,7 +3079,7 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
 
             start1 = start2; // fake start1 so the start_lsn calc below works
             end1 = start2;
-            
+
             base_lsn_before = base_lsn_after;
         }
         else if(base_lsn_before.file() == base_lsn_after.file()) {
@@ -2742,13 +3088,13 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
             // race here with insert setting _curr_epoch.end, but
             // it won't matter. Since insert already did the memcpy,
             // we are safe and can flush the entire amount.
-            end2 = _cur_epoch.end;            
+            end2 = _cur_epoch.end;
             _cur_epoch.start = end2;
 
             start1 = _old_epoch.start;
             end1 = _old_epoch.end;
             _old_epoch.start = end1;
-            
+
             w_assert1(base_lsn_before + segsize() == base_lsn_after);
         }
         else {
@@ -2756,7 +3102,7 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
             // two epochs target different files. Let the next
             // flush handle the new epoch.
             start2 = 0;
-            end2 = 0; // don't fake end2 because end_lsn needs to see '0' 
+            end2 = 0; // don't fake end2 because end_lsn needs to see '0'
 
             start1 = _old_epoch.start;
             end1 = _old_epoch.end;
@@ -2784,7 +3130,7 @@ lsn_t log_core::flush_daemon_work(lsn_t old_mark)
     // will open a new partition into which to flush.
     // That, in turn, is determined by whether the _old_epoch.base_lsn.file()
     // matches the _cur_epoch.base_lsn.file()
-    _flushX(start_lsn, start1, end1, start2, end2);
+    _flushX(start_lsn, end_lsn, start1, end1, start2, end2);
 
     _durable_lsn = end_lsn;
     _start = new_start;
@@ -3005,7 +3351,7 @@ log_core::activate_reservations()
      */
     w_assert1(operating_mode == t_forward_processing);
 	// FRJ: not true if any logging occurred during recovery
-    // w_assert1(PARTITION_COUNT*_partition_data_size == 
+    // w_assert1(PARTITION_COUNT*_partition_data_size ==
     //       _space_available + _space_rsvd_for_chkpt);
     w_assert1(!_reservations_active);
 

@@ -52,6 +52,7 @@
 typedef enum {
     RDMA_INIT_OP,
     RDMA_OPEN_FILE,
+    RDMA_LSEEK_FILE,
     RDMA_CLOSE_FILE,
     RDMA_UNLINK_FILE,
     RDMA_RENAME_FILE,
@@ -77,9 +78,16 @@ typedef struct rdmaOpenFilePayload {
     char filename[MAX_FILE_NAME_SIZE];
 } RdmaOpenFilePayload __attribute__((packed));
 
+typedef struct rdmaLseekFilePayload {
+    unsigned int reqId;
+    unsigned int fd;
+    off_t position;
+    int whence;
+} RdmaLseekFilePayload __attribute__((packed));
+
 typedef struct rdmaCloseFilePayload {
     unsigned int reqId;
-    int fd;
+    unsigned int fd;
 } RdmaCloseFilePayload __attribute__((packed));
 
 typedef struct rdmaUnlinkFilePayload {
@@ -120,7 +128,10 @@ typedef struct rdmaFstatPayload {
 typedef struct rdmaSyscallResponse {
     int status;
     int errnum;
-    struct stat statbuf;
+    union { // not relevant for most operations, but too much effort to make a separate payload and RDMA setup for each
+        struct stat statbuf; // used by statbuf
+        off_t offset; // used by lseek
+    };
 } RdmaSyscallResponse __attribute__((packed));
 
 typedef struct rdmaWriteFilePayload {

@@ -67,6 +67,12 @@ Rome Research Laboratory Contract No. F30602-97-2-0247.
 #include "crash.h"
 #include <algorithm> // for std::swap
 #include <stdio.h> // snprintf
+#include <fcntl.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <unistd.h>
+#include "rdma_integration.h"
+#include "lsn_t_c.h"
 
 typedef smlevel_0::fileoff_t fileoff_t;
 
@@ -370,27 +376,42 @@ log_m::_make_master_name(
 }
 
 void
-log_m::_write_master(lsn_t l, lsn_t min) 
+log_m::_write_master(lsn_t l, lsn_t min)
 {
     /*
-     *  create new master record
+     * create new master record
      */
-    char _chkpt_meta_buf[CHKPT_META_BUF];
-    _make_master_name(l, min, _chkpt_meta_buf, CHKPT_META_BUF);
-    DBGTHRD(<< "writing checkpoint master: " << _chkpt_meta_buf);
+    char _chkpt_meta_buf[CHKPT_META_BUF]; // Buffer for filename/contents
 
-    FILE* f = fopen(_chkpt_meta_buf, "a");
-    if (! f) {
-        w_rc_t e = RC(eOS);    
-        smlevel_0::errlog->clog << fatal_prio 
-            << "ERROR: could not open a new log checkpoint file: "
-            << _chkpt_meta_buf << flushl;
-        W_COERCE(e);
+    // --- Part 1: Make the new master filename ---
+    // The filename is constructed based on the new master LSN and min checkpoint record LSN.
+    _make_master_name(l, min, _chkpt_meta_buf, CHKPT_META_BUF);
+    DBGTHRD(<< "writing checkpoint master: " << _chkpt_meta_buf); // Debug filename
+
+    // --- Start Modification: Replace fopen with rdmaOpenFile ---
+    // Open the *new* master checkpoint file for writing.
+    // The original code used "a" (append), which means open for writing, create if doesn't exist,
+    // and append writes to the end. We'll use the corresponding RDMA flags.
+    // O_WRONLY | O_APPEND | O_CREAT is the syscall equivalent of "a".
+    RdmaSyscallResponse openResponse = rdmaOpenFile(_chkpt_meta_buf, O_WRONLY | O_APPEND | O_CREAT, (S_IRWXU | S_IRWXG | S_IRWXO)); // Use path in buffer
+    int fd = openResponse.status; // Assume status holds the client file handle on success
+
+    if (fd < 0) { // Check status for error (handle < 0 as error)
+        w_rc_t e = RC(eOS); // Use eOS for generic OS/syscall errors
+        smlevel_0::errlog->clog << fatal_prio
+            << "ERROR: could not open/create a new log checkpoint file: "
+            << _chkpt_meta_buf << endl << e << flushl; // Add error details
+        W_COERCE(e); // Handle fatal error (Exits or throws)
+        // Consider returning error code instead of W_COERCE
+        return; // Exit function on failure as file could not be opened
     }
 
+    // --- Part 2: Write the file contents ---
     {        /* write ending lsns into the master chkpt record */
-        lsn_t         array[PARTITION_COUNT];
-#if 0
+        lsn_t         array[PARTITION_COUNT]; // Buffer to hold LSNs to format
+
+        // Get LSNs of last records in partitions (these are typically skip record LSNs)
+#if 0 // Original commented code for getting LSNs
         int j=0;
         for(int i=0; i < PARTITION_COUNT; i++) {
             const partition_t *p = this->_partition(i);
@@ -398,36 +419,103 @@ log_m::_write_master(lsn_t l, lsn_t min)
                 array[j++] = p->last_skip_lsn();
             }
         }
-#else
-        int j = log_core::THE_LOG->get_last_lsns(array);
+#else // Active code using log_core
+        int j = log_core::THE_LOG->get_last_lsns(array); // Get LSNs from log_core - OK
 #endif
-        if(j > 0) {
-            w_ostrstream s(_chkpt_meta_buf, CHKPT_META_BUF);
-            _create_master_chkpt_contents(s, j, array);
+
+        // Use the same buffer (_chkpt_meta_buf) to format the contents string that will be written.
+        // Need a string stream to format the contents into the buffer.
+        w_ostrstream s_contents(_chkpt_meta_buf, CHKPT_META_BUF);
+        if (j > 0) {
+             // Format the list of LSNs into the buffer
+             _create_master_chkpt_contents(s_contents, j, array);
         } else {
-            memset(_chkpt_meta_buf, '\0', 1);
+            // If no LSNs to write, just null terminate the buffer to make it an empty string content.
+            s_contents << ends; // Writes null terminator
         }
+        // Check if stream construction failed (buffer too small to even format an empty string?)
+        w_assert1(s_contents);
+
+        // Calculate the length of the formatted string including the null terminator.
         int length = strlen(_chkpt_meta_buf) + 1;
+
         DBG(<< " #lsns=" << j
             << " write this to master checkpoint record: " <<
-                _chkpt_meta_buf);
+                _chkpt_meta_buf); // Debug message showing content to be written
 
-        if(fwrite(_chkpt_meta_buf, length, 1, f) != 1) {
-            w_rc_t e = RC(eOS);    
-            smlevel_0::errlog->clog << fatal_prio 
-                << "ERROR: could not write log checkpoint file contents"
-                << _chkpt_meta_buf << flushl;
-            W_COERCE(e);
+        // --- Start Modification: Replace fwrite with rdmaWalWrite ---
+        // Write the formatted contents string to the file opened with O_APPEND.
+        // Use the file descriptor 'fd'.
+        // The offset parameter in rdmaWalWrite is needed because your server uses aio_offset,
+        // even when opened with O_APPEND on the client.
+        // For the first write in an O_APPEND file, the offset should typically be 0, as the server
+        // will position at the end before writing.
+        // LSN: Null (the contents are a list of LSNs, not a single log record with an LSN).
+        // Start/End: True (this write constitutes the entire content of the new master file).
+        ssize_t write_result = rdmaWalWrite(_chkpt_meta_buf, fd, nullptr, 0, length, true, true); // Use 0 offset for append, null lsn, true/true flags
+
+        // Check the return value of rdmaWalWrite (ssize_t).
+        // Full success is writing exactly 'length' bytes.
+        // Failure is -1 or potentially a short write (< length, >= 0).
+        if (write_result != (ssize_t)length) {
+            w_rc_t e = RC(eOS); // Original code used eOS
+            if (write_result < 0) { // Explicit error return (-1)
+                smlevel_0::errlog->clog << fatal_prio
+                    << "ERROR: rdmaWalWrite failed writing log checkpoint file contents at offset 0. Return value: "
+                    << write_result << "..." << flushl; // Add return value to log
+                W_COERCE(e); // Handle fatal error (Exits or throws)
+            } else { // Short write occurred (0 <= result < length)
+                smlevel_0::errlog->clog << fatal_prio
+                    << "ERROR: rdmaWalWrite short write for log checkpoint file contents at offset 0. Wrote "
+                    << write_result << " of " << length << " bytes." << flushl; // Add details
+                W_COERCE(e); // Treat short write as fatal error
+            }
+            // --- Start Modification: Ensure rdmaCloseFile is called on error ---
+            // Close the file handle if the write failed before exiting the function.
+            RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+            if (closeResponse.status < 0) { // Error closing file after write error
+                 w_rc_t close_e = RC(eOS);
+                 smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after write error for fd " << fd << endl << close_e << endl;
+                 // W_COERCE(close_e); // Decide if close error after write error should be fatal
+            }
+            // --- End Modification: rdmaCloseFile on error ---
+            return; // Exit function on write failure
         }
+        // --- End Modification: Replace fwrite ---
+
+    } // End block for writing file contents
+
+    // --- Start Modification: Replace fclose with rdmaCloseFile ---
+    // Close the new master checkpoint file after successfully writing contents.
+    RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+    if (closeResponse.status < 0) { // Check status for error (handle < 0 as error)
+         w_rc_t e = RC(eOS); // Use eOS
+         smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after writing log checkpoint file for fd " << fd << endl << e << endl;
+         // W_COERCE(e); // Decide if close error should be fatal. Original did not check fclose return.
+         // If this should be fatal, add W_COERCE(e) and consider returning error code.
     }
-    fclose(f);
+    // --- End Modification: Replace fclose ---
+
 
     /*
-     *  destroy old master record
+     * destroy old master record
      */
-    _make_master_name(_master_lsn, 
+    // Re-use _chkpt_meta_buf to build the name of the old master record
+    _make_master_name(_master_lsn,
                 _min_chkpt_rec_lsn, _chkpt_meta_buf, CHKPT_META_BUF);
-    (void) unlink(_chkpt_meta_buf);
+
+    // --- Start Modification: Replace unlink with rdmaUnlinkFile ---
+    // (void) unlink(_chkpt_meta_buf); // Original syscall (result ignored)
+    RdmaSyscallResponse unlinkResponse = rdmaUnlinkFile(_chkpt_meta_buf, NORMAL); // Use RDMA unlink
+    // Check status for error (0 for success, non-zero for error)
+    if (unlinkResponse.status != 0) {
+         w_rc_t e = RC(eOS); // Original used eOS
+         smlevel_0::errlog->clog << error_prio // Log as error (original ignored result)
+             << "rdmaUnlinkFile(" << _chkpt_meta_buf << "): failed. Status: " << unlinkResponse.status << endl << e << flushl; // Log status and error details
+         // W_COERCE(e); // Decide if unlink error should be fatal. Original ignored result.
+         // To match original behavior, log error but don't W_COERCE.
+    }
+    // --- End Modification: Replace unlink ---
 }
 
 /*********************************************************************
@@ -605,86 +693,189 @@ long log_m::max_chkpt_size() const
 }
 
 w_rc_t
-log_m::_read_master( 
-        const char *fname,
-        int prefix_len,
-        lsn_t &tmp,
-        lsn_t& tmp1,
-        lsn_t* lsnlist,
-        int&   listlength,
-        bool&  old_style
+log_m::_read_master(
+        const char *fname, // Name of the master checkpoint file
+        int prefix_len,    // Length of the master prefix in fname
+        lsn_t &tmp,        // Output: Master LSN parsed from filename
+        lsn_t& tmp1,       // Output: Min Checkpoint Record LSN parsed from filename
+        lsn_t* lsnlist,    // Output: Array to store LSN hints from file contents
+        int&   listlength, // Output: Number of LSN hints stored in lsnlist
+        bool&  old_style   // Output: Flag indicating old file format style
 )
 {
-    rc_t         rc;
-    {
-        /* make a copy */
-        int        len = strlen(fname+prefix_len) + 1;
-        char *buf = new char[len];
-        memcpy(buf, fname+prefix_len, len);
-        w_istrstream s(buf);
+    w_rc_t         rc; // Use w_rc_t for Shore-MT error codes
 
-        rc = _parse_master_chkpt_string(s, tmp, tmp1, 
+    // --- Part 1: Parse LSNs from the filename ---
+    { // Block for filename parsing
+        /* make a copy */
+        // The filename itself contains some LSN information to parse.
+        int        len = strlen(fname + prefix_len) + 1;
+        char *buf = new char[len]; // Allocate buffer for filename parsing
+        // Error check for allocation
+        if (!buf) {
+            W_FATAL(fcOUTOFMEMORY); // Handle allocation failure
+             // Return an error code as W_FATAL might not exit immediately depending on config
+            return RC(fcOUTOFMEMORY);
+        }
+        memcpy(buf, fname + prefix_len, len); // Copy the part of the filename after the prefix
+        w_istrstream s(buf); // Use an input string stream to parse the copied filename part
+
+        // Call the helper function to parse the string content
+        rc = _parse_master_chkpt_string(s, tmp, tmp1,
                                        listlength, lsnlist, old_style);
-        delete [] buf;
+
+        delete [] buf; // Clean up buffer
+        buf = nullptr; // Prevent double free (optional, good practice)
+
         if (rc.is_error()) {
-            smlevel_0::errlog->clog << fatal_prio 
-            << "bad master log file \"" << fname << "\"" << flushl;
-            W_COERCE(rc);
+            // Log error if filename parsing fails
+            smlevel_0::errlog->clog << fatal_prio
+            << "bad master log file name format \"" << fname << "\"" << endl << rc << flushl; // Added rc to log
+            W_COERCE(rc); // Handle fatal error (exits or throws depending on config)
+            return rc; // Return error code on failure
         }
         DBG(<<"_parse_master_chkpt_string returns tmp= " << tmp
             << " tmp1=" << tmp1
-            << " old_style=" << old_style);
-    }
+            << " old_style=" << old_style); // Debug success
+    } // End block for filename parsing
 
-    /*  
-     * read the file for the rest of the lsn list
-     */
-    {
-        char*         buf = new char[smlevel_0::max_devname];
-        if (!buf)
-            W_FATAL(fcOUTOFMEMORY);
-        w_auto_delete_array_t<char> ad_fname(buf);
-        w_ostrstream s(buf, int(smlevel_0::max_devname));
-        s << _logdir << _SLASH << fname << ends;
-
-        FILE* f = fopen(buf, "r");
-        if(f) {
-            char _chkpt_meta_buf[CHKPT_META_BUF];
-            int n = fread(_chkpt_meta_buf, 1, CHKPT_META_BUF, f);
-            if(n  > 0) {
-                /* Be paranoid about checking for the null, since a lack
-                   of it could send the istrstream driving through memory
-                   trying to parse the information. */
-                void *null = memchr(_chkpt_meta_buf, '\0', CHKPT_META_BUF);
-                if (!null) {
-                    smlevel_0::errlog->clog << fatal_prio 
-                        << "invalid master log file format \"" 
-                        << buf << "\"" << flushl;
-                    W_FATAL(eINTERNAL);
-                }
-                    
-                w_istrstream s(_chkpt_meta_buf);
-                rc = _parse_master_chkpt_contents(s, listlength, lsnlist);
-                if (rc.is_error())  {
-                    smlevel_0::errlog->clog << fatal_prio 
-                        << "bad master log file contents \"" 
-                        << buf << "\"" << flushl;
-                    W_COERCE(rc);
-                }
-            }
-            fclose(f);
-        } else {
-            /* backward compatibility with minor version 0: 
-             * treat empty file ok
-             */
-            w_rc_t e = RC(eOS);
-            smlevel_0::errlog->clog << fatal_prio
-                << "ERROR: could not open existing log checkpoint file: "
-                << buf << flushl;
-            W_COERCE(e);
+    // --- Part 2: Read the file contents for additional LSN list (checkpoint metadata) ---
+    { // Block for reading and parsing file contents
+        // Use buf for building the full path to the master checkpoint file
+        char* buf = new char[smlevel_0::max_devname]; // Allocate buffer for path
+        // Error check for allocation
+        if (!buf) {
+            W_FATAL(fcOUTOFMEMORY); // Handle allocation failure
+             // Return an error code as W_FATAL might not exit immediately depending on config
+            return RC(fcOUTOFMEMORY);
         }
-    }
-    return RCOK;
+        w_auto_delete_array_t<char> ad_fname(buf); // Cleanup for buf
+
+        // Build the full path: directory + slash + filename
+        w_ostrstream s_path(buf, int(smlevel_0::max_devname)); // Use a stream to build the path
+        s_path << _logdir << _SLASH << fname << ends; // Construct the path string
+
+        // --- Start Modification: Replace fopen with rdmaOpenFile ---
+        RdmaSyscallResponse openResponse = rdmaOpenFile(buf, O_RDONLY, (S_IRWXU | S_IRWXG | S_IRWXO)); // Open for reading (mode is likely ignored)
+        int fd = openResponse.status; // Assume status holds the client file handle on success
+
+        if (fd < 0) { // Check status for error (handle < 0 as error)
+            /* backward compatibility with minor version 0:
+             * treat empty file ok - The original code handled fopen failure here.
+             * A missing or inaccessible file should be handled as an error.
+             * If the file is truly optional (backward compatibility), maybe just log error and return RCOK.
+             * The original used W_COERCE(e) which is fatal for unexpected errors. Let's match that.
+             */
+            w_rc_t e = RC(eOS); // Use eOS for generic OS/syscall errors
+            smlevel_0::errlog->clog << fatal_prio // Log as fatal error
+                << "ERROR: could not open existing log checkpoint file: "
+                << buf << endl << e << flushl; // Added endl e for error details
+            W_COERCE(e); // Handle fatal error (Exits or throws)
+            return e; // Return error code
+        }
+
+        // --- Start Modification: Replace fread with rdmaWalRead ---
+        char _chkpt_meta_buf[CHKPT_META_BUF]; // Buffer for file contents
+        ssize_t n = rdmaWalRead(fd, 0, CHKPT_META_BUF, _chkpt_meta_buf); // Read CHKPT_META_BUF bytes from offset 0
+
+        // --- Start Modification: Handle rdmaWalRead results ---
+        if (n < 0) { // Read error occurred
+            w_rc_t e = RC(eOS); // Use eOS
+            smlevel_0::errlog->clog << fatal_prio
+                << "ERROR: rdmaWalRead failed reading log checkpoint file: "
+                << buf << ". Return value: " << n << "." << endl << e << flushl; // Added return value and error details
+            // --- Start Modification: Ensure rdmaCloseFile is called on error ---
+            RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+            if (closeResponse.status < 0) { // Error closing file after read error
+                 w_rc_t close_e = RC(eOS);
+                 smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after read error for fd " << fd << endl << close_e << endl;
+                 // W_COERCE(close_e); // Decide if close error after read error should be fatal
+            }
+            // --- End Modification: rdmaCloseFile on error ---
+            W_COERCE(e); // Handle fatal error (Exits or throws)
+            return e; // Return error code
+        } else if (n == 0) { // Empty file (rdmaWalRead returned 0 at offset 0)
+            /* backward compatibility with minor version 0:
+             * treat empty file ok. An empty file has no metadata to parse.
+             * listlength will remain 0, lsnlist will be untouched.
+             */
+            DBG(<<"Log checkpoint file " << buf << " is empty. Treating as valid but empty metadata.");
+            // No parsing needed for an empty file.
+        } else { // Read successful (n > 0, could be full or partial)
+
+            // Ensure the buffer is null-terminated before parsing with istrstream.
+            // If n < CHKPT_META_BUF, we can add the null terminator at the end of read data.
+            // If n == CHKPT_META_BUF, we must check if a null byte exists within the read data,
+            // as the original code did using memchr.
+            bool null_found_in_buffer = false;
+            if (n < CHKPT_META_BUF) {
+                 _chkpt_meta_buf[n] = '\0'; // Null-terminate right after the data read
+                 null_found_in_buffer = true; // Explicitly added null, so null is found
+            } else { // n == CHKPT_META_BUF (buffer filled)
+                 // Check if a null byte exists within the full buffer contents
+                 if (memchr(_chkpt_meta_buf, '\0', CHKPT_META_BUF)) {
+                     null_found_in_buffer = true; // Null byte was found within the buffer
+                 }
+                 // If null_found_in_buffer is false, the buffer is full without a terminator.
+            }
+
+            if (!null_found_in_buffer) {
+                 // Buffer was filled but no null byte found. Invalid format.
+                 smlevel_0::errlog->clog << fatal_prio
+                     << "invalid master log file format (no null terminator found) \""
+                     << buf << "\"" << flushl; // Log message
+                 // --- Start Modification: Ensure rdmaCloseFile is called on error ---
+                 RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+                 if (closeResponse.status < 0) { // Error closing file
+                      w_rc_t close_e = RC(eOS);
+                      smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after format error for fd " << fd << endl << close_e << endl;
+                      // W_COERCE(close_e); // Decide if close error after read error should be fatal
+                 }
+                 // --- End Modification: rdmaCloseFile on error ---
+                 W_FATAL(eINTERNAL); // Handles fatal error (invalid format)
+                 return RC(eINTERNAL); // Return error code
+            }
+
+            // Parse the contents of the buffer using the null-terminated data
+            w_istrstream s_contents(_chkpt_meta_buf); // Use a stream to parse buffer contents
+            rc = _parse_master_chkpt_contents(s_contents, listlength, lsnlist); // Parse buffer contents - OK
+
+            if (rc.is_error()) {
+                // Log error if parsing contents fails
+                smlevel_0::errlog->clog << fatal_prio
+                    << "bad master log file contents \""
+                    << buf << "\"" << endl << rc << flushl; // Added rc to log
+                // --- Start Modification: Ensure rdmaCloseFile is called on error ---
+                RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+                if (closeResponse.status < 0) { // Error closing file
+                     w_rc_t close_e = RC(eOS);
+                     smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after parse error for fd " << fd << endl << close_e << endl;
+                     // W_COERCE(close_e); // Decide if close error after read error should be fatal
+                }
+                // --- End Modification: rdmaCloseFile on error ---
+                W_COERCE(rc); // Handles fatal error (Exits or throws)
+                return rc; // Return error code
+            }
+        } // End else (read successful > 0)
+        // --- End Modification: Handle rdmaWalRead results ---
+
+        // --- Start Modification: Replace fclose with rdmaCloseFile ---
+        // Close the file if it was opened successfully (fd >= 0)
+        // This ensures the file is closed after reading and parsing.
+        if (fd >= 0) { // Defensive check, should be true if we reached here from open success and no fatal error occurred
+             RdmaSyscallResponse closeResponse = rdmaCloseFile(fd);
+             if (closeResponse.status < 0) { // Error closing file
+                  w_rc_t e = RC(eOS);
+                  smlevel_0::errlog->clog << error_prio << "rdmaCloseFile failed after reading log checkpoint file for fd " << fd << endl << e << endl;
+                  // W_COERCE(e); // Decide if close error should be fatal
+                  // If this is fatal, consider returning error code 'e' here instead of RCOK
+             }
+        }
+        // --- End Modification: rdmaCloseFile ---
+
+    } // End block for reading and parsing file contents
+
+    return RCOK; // Return success code if everything completed without fatal error
 }
 
 fileoff_t log_m::take_space(fileoff_t volatile* ptr, int amt) 

@@ -8,6 +8,7 @@ typedef struct operationLog {
     int messageType;
     union {
         RdmaOpenFilePayload openFilePayload;
+        RdmaLseekFilePayload lseekFilePayload;
         RdmaCloseFilePayload closeFilePayload;
         RdmaUnlinkFilePayload unlinkFilePayload;
         RdmaRenameFilePayload renameFilePayload;

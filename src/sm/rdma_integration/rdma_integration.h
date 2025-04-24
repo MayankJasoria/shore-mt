@@ -27,6 +27,8 @@ void rdmaInitMessage(char* message);
 // open a file on remote machine
 RdmaSyscallResponse rdmaOpenFile(char* filename, int flags, mode_t mode);
 
+RdmaSyscallResponse rdmaLseekFile(int fd, off_t position, int whence);
+
 // close a file on remote machine
 RdmaSyscallResponse rdmaCloseFile(int fd);
 
@@ -44,7 +46,7 @@ RdmaSyscallResponse rdmaStatCall(char* path);
 
 RdmaSyscallResponse rdmaFstatCall(unsigned int fd);
 
-bool rdmaWalWrite(const char* msg, unsigned int fd, lsn_t_c* lsn, off_t offset, size_t size, bool start, bool end);
+ssize_t rdmaWalWrite(const char* msg, unsigned int fd, lsn_t_c* lsn, off_t offset, size_t size, bool start, bool end);
 
 ssize_t rdmaWalRead(unsigned int fd, off_t offset, size_t size, char* buffer);
 

@@ -736,6 +736,27 @@ RdmaSyscallResponse rdmaOpenFile(char* filename, int flags, mode_t mode) {
   return awaitAcknowledgement(node);
 }
 
+RdmaSyscallResponse rdmaLseekFile(int fd, off_t position, int whence) {
+  int reqId = getRequestId();
+  RdmaLseekFilePayload payload;
+  payload.reqId = reqId;
+  payload.fd = fd;
+  payload.position = position;
+  payload.whence = whence;
+
+  ChainNode* node = insert(hashTable, reqId);
+  if (!sendRdmaMessage((char*) &payload, sizeof(RdmaLseekFilePayload), RDMA_LSEEK_FILE)) {
+    deleteNode(hashTable, node);
+    RdmaSyscallResponse response;
+    response.status = -1;
+    response.errnum = EAGAIN;
+    return response;
+  }
+
+  // awair ack and return result
+  return awaitAcknowledgement(node);
+}
+
 // close a file on remote machine
 RdmaSyscallResponse rdmaCloseFile(int fd) {
   int reqId = getRequestId();
@@ -951,10 +972,19 @@ ssize_t rdmaWalRead(unsigned int fd, off_t offset, size_t size, char* buffer) {
   return receivedSize;
 }
 
-bool rdmaWalWrite(const char* msg, unsigned int fd, lsn_t_c* lsn, off_t offset, size_t size, bool start, bool end) {
-  for (size_t diffFromOffset = 0; diffFromOffset < size; diffFromOffset += MAX_WRITE_MESSAGE_SIZE) {
+ssize_t rdmaWalWrite(const char* msg, unsigned int fd, lsn_t_c* lsn, off_t offset, size_t size, bool start, bool end) {
+  if (size == 0) {
+    return 0;
+  }
+  if (msg == NULL) {
+    errno = EFAULT;
+    return -1;
+  }
+  size_t total_bytes_requested = size; // Store the total size requested
+  size_t bytes_sent_so_far = 0; // Track bytes successfully sent
+  for (size_t diffFromOffset = 0; diffFromOffset < total_bytes_requested; diffFromOffset += MAX_WRITE_MESSAGE_SIZE) {
     // each chunk will hava a max size of 'MAX_WRITE_MESSGE_SIZE'
-    size_t msgSize = MIN(MAX_WRITE_MESSAGE_SIZE, size - diffFromOffset);
+    size_t msgSize = MIN(MAX_WRITE_MESSAGE_SIZE, total_bytes_requested - diffFromOffset);
     RdmaWriteFilePayload payload;
     payload.lsn_offset = lsn_get_offset_c(lsn);
     payload.lsn_partition = lsn_get_partition_c(lsn);
@@ -962,16 +992,19 @@ bool rdmaWalWrite(const char* msg, unsigned int fd, lsn_t_c* lsn, off_t offset, 
     payload.offset = offset + diffFromOffset;
     payload.size = msgSize;
     payload.start = (diffFromOffset == 0 && start);
-    payload.end = (size <= diffFromOffset + MAX_WRITE_MESSAGE_SIZE && end);
+    payload.end = (total_bytes_requested <= diffFromOffset + MAX_WRITE_MESSAGE_SIZE && end);
     memcpy(payload.data, msg + diffFromOffset, msgSize);
 
     if (!sendRdmaMessage((char*) &payload, sizeof(RdmaWriteFilePayload), RDMA_WRITE_FILE)) {
-      return false; // write failed
+      errno = EAGAIN;
+      return -1; // write failed
     }
+
+    bytes_sent_so_far += msgSize;
   }
 
   // if all messages were sent, assume write success
-  return true;
+  return total_bytes_requested;
 }
 
 int isRdmaFlushCompleted(lsn_t_c* lsn) {

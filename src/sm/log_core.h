@@ -80,6 +80,8 @@ class skip_log; // forward
 
 class log_core : public log_m 
 {
+    friend class partition_t; // DANGER! Consider any other option if you can
+
 	struct waiting_xct {
 		fileoff_t* needed;
 		pthread_cond_t* cond;
@@ -300,7 +302,7 @@ public:
     lsn_t           flush_daemon_work(lsn_t old_mark);
 
 private:
-    void            _flushX(lsn_t base_lsn, long start1, long end1, long start2, long end2);
+    void            _flushX(lsn_t base_lsn, lsn_t end_lsn, long start1, long end1, long start2, long end2);
     void            _set_size(fileoff_t psize);
     fileoff_t       _get_min_size() const {
                         // Return minimum log size as a function of the

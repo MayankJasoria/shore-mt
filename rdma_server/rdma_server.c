@@ -250,7 +250,7 @@ static void sendControlAcknowledgement(int reqId, uintptr_t buf) {
   send_desc.wr_id = reqId;
 
   rdmaio_reqpayload_t send_payload;
-  send_payload.local_addr = (uintptr_t) writeControlResponseToSendBuffer(0, 0); // success!
+  send_payload.local_addr = buf;
   send_payload.remote_addr = 0;
   send_payload.imm_data = reqId;
 
@@ -317,6 +317,7 @@ static void sendFlushAcknowledgement(int status, uint32_t lsn_partition, uint64_
 
 static uintptr_t writeResponseToReadSendBuffer(unsigned int reqId, int status, int error, off_t offset, size_t size, bool end, char* buf) {
   RdmaReadFileResponse response;
+  response.reqId = reqId;
   response.status = status;
   response.errnum = error;
   response.offset = offset;
@@ -523,8 +524,32 @@ static void handleFileOpen(unsigned int reqId, int flags, mode_t mode, char* fil
     return;
   }
 
-  // report success
+  // report success (fd will be non-negative)
+  uintptr_t response = writeControlResponseToSendBuffer(fd, 0);
+  sendControlAcknowledgement(reqId, response);
+  return;
+}
+
+static void handleFileLseek(unsigned int reqId, unsigned int version, off_t position, int whence) {
+  HashNode* node = get(fileHashTable, version);
+  if (!node) {
+    fprintf(stderr, "Could not find file node for version %u to lseek.\n", version);
+    uintptr_t response = writeControlResponseToSendBuffer(-1, EBADF);
+    sendControlAcknowledgement(reqId, response);
+    return;
+  }
+
+  int server_local_fd = node->fd;
+  off_t res = lseek(server_local_fd, position, whence);
+  if (res == (off_t)-1) {
+    fprintf(stderr, "Could not lseek file (fd: %d): %s\n", server_local_fd, strerror(errno));
+    uintptr_t response = writeControlResponseToSendBuffer(-1, errno);
+    sendControlAcknowledgement(reqId, response);
+    return;
+  }
+
   uintptr_t response = writeControlResponseToSendBuffer(0, 0);
+  ((RdmaSyscallResponse*) response)->offset = res;
   sendControlAcknowledgement(reqId, response);
   return;
 }
@@ -607,7 +632,7 @@ static void handleFileUnlink(unsigned int reqId, OpType opType, char* filename) 
 
 static void handleFileRename(unsigned int reqId, OpType opType, char* oldFilename, char* newFilename) {
   char full_old_path[MAX_FILE_NAME_SIZE + LOG_PATH_SIZE];
-  int res = snprintf(full_old_path, MAX_FILE_NAME_SIZE + LOG_PATH_SIZE, "%s%s", LOG_PATH, full_old_path);
+  int res = snprintf(full_old_path, MAX_FILE_NAME_SIZE + LOG_PATH_SIZE, "%s%s", LOG_PATH, oldFilename);
   if (res < 0) {
     fprintf(stderr, "Could not create path length\n");
     uintptr_t response = writeControlResponseToSendBuffer(-1, EAGAIN);
@@ -616,7 +641,7 @@ static void handleFileRename(unsigned int reqId, OpType opType, char* oldFilenam
   }
 
   char full_new_path[MAX_FILE_NAME_SIZE + LOG_PATH_SIZE];
-  res = snprintf(full_new_path, MAX_FILE_NAME_SIZE + LOG_PATH_SIZE, "%s%s", LOG_PATH, full_new_path);
+  res = snprintf(full_new_path, MAX_FILE_NAME_SIZE + LOG_PATH_SIZE, "%s%s", LOG_PATH, newFilename);
   if (res < 0) {
     fprintf(stderr, "Could not create path length\n");
     uintptr_t response = writeControlResponseToSendBuffer(-1, EAGAIN);
@@ -831,6 +856,12 @@ static void* processOperations(void* arg) {
       {
 	    RdmaOpenFilePayload payload = op->openFilePayload;
 	    handleFileOpen(payload.reqId, payload.flags, payload.mode, payload.filename);
+	    break;
+      }
+      case RDMA_LSEEK_FILE:
+      {
+	    RdmaLseekFilePayload payload = op->lseekFilePayload;
+	    handleFileLseek(payload.reqId, payload.fd, payload.position, payload.whence);
 	    break;
       }
       case RDMA_CLOSE_FILE:
@@ -1265,7 +1296,7 @@ static void* processReadRequests(void* args) {
       // chunked read responses
       char* send_buf = buf + offset;
       ssize_t chunk_size = read_size - offset;
-      if (chunk_size <= MAX_READ_MESSAGE_SIZE) {
+      if (chunk_size <= (ssize_t) MAX_READ_MESSAGE_SIZE) {
         // last chunk
         sendReadAcknowledgement(payload->reqId, 0, 0, offset, chunk_size, true, NULL);
       } else {
