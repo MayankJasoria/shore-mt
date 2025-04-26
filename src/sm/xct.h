@@ -259,7 +259,9 @@ public:
                                     __stats = s;
                                 }
     void                        clear_stats() {
-                                    memset(__stats,0, sizeof(*__stats)); 
+                                    if (__stats) {
+                                        __stats->clear();
+                                    };
                                 }
     sm_stats_info_t*            steal_stats() {
                                     sm_stats_info_t*s = __stats; 

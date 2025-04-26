@@ -277,11 +277,19 @@ public:
 
     key_location_t() : _in_hdr(false), _off(0), _length(0)  {}
 
-    key_location_t(const key_location_t &old) : 
-        _in_hdr(old._in_hdr), 
+    key_location_t(const key_location_t &old) :
+        _in_hdr(old._in_hdr),
         _off(old._off), _length(old._length) {}
 
-    /// Key is in record header
+    key_location_t& operator=(const key_location_t &old) {
+        if (this != &old) {
+            _in_hdr = old._in_hdr;
+            _off = old._off;
+            _length = old._length;
+        }
+        return *this;
+    }
+
     bool is_in_hdr() const { return _in_hdr; }
 };
 
@@ -1014,14 +1022,24 @@ private:
         w_base_t::int1_t _mask;
         fill1            _dummy1;
         fill2            _dummy2;
-        key_meta_t() : _cb_keycmp(0), _cb_keyinfo(0), 
-            _cookie(0),
-            _mask(t_none) {}
-        key_meta_t(const key_meta_t &old) : 
-            _cb_keycmp(old._cb_keycmp), 
+
+        key_meta_t() : _cb_keycmp(0), _cb_keyinfo(0), _cookie(0), _mask(t_none) {}
+
+        key_meta_t(const key_meta_t &old) :
+            _cb_keycmp(old._cb_keycmp),
             _cb_keyinfo(old._cb_keyinfo),
             _cookie(old._cookie),
             _mask(old._mask) {}
+
+        key_meta_t& operator=(const key_meta_t &old) {
+            if (this != &old) {
+                _cb_keycmp = old._cb_keycmp;
+                _cb_keyinfo = old._cb_keyinfo;
+                _cookie = old._cookie;
+                _mask = old._mask;
+            }
+            return *this;
+        }
     };
     int        _nkeys;        // constructor 
     int        _spaces;    // _grow
@@ -1495,7 +1513,9 @@ ssm_sort::sort_keys_t::_grow(int i)
     key_location_t* tmp = new key_location_t[_spaces + i];
     if(!tmp) W_FATAL(fcOUTOFMEMORY);
     if(_locs) {
-        memcpy(tmp, _locs, nkeys() * sizeof(key_location_t));
+        for (int j = 0; j < nkeys(); ++j) {
+            tmp[j] = _locs[j];
+        }
         delete[] _locs;
     }
     _locs = tmp;
@@ -1504,7 +1524,9 @@ ssm_sort::sort_keys_t::_grow(int i)
     key_meta_t* tmp = new key_meta_t[_spaces + i];
     if(!tmp) W_FATAL(fcOUTOFMEMORY);
     if(_meta) {
-        memcpy(tmp, _meta, nkeys() * sizeof(key_meta_t));
+        for (int j = 0; j < nkeys(); ++j) {
+            tmp[j] = _meta[j];
+        }
         delete[] _meta;
     }
     _meta = tmp;

@@ -1242,15 +1242,15 @@ struct page_splice_t {
     char                 data[logrec_t::data_sz - 4 * sizeof(int2_t)]; // old data & new data
 
     NORET                page_splice_t(
-        int                     i, 
-        uint                     start, 
-        uint                     len, 
+        int                     i,
+        uint                     start,
+        uint                     len,
         const void*             tuple,
         const cvec_t&             v);
     void*                 old_image()   { return data; }
     void*                 new_image()   { return data + old_len; }
-    int                        size()  { 
-        return data + old_len + new_len - (char*) this; 
+    int                        size()  {
+        return data + old_len + new_len - (char*) this;
     }
 };
 
@@ -1260,7 +1260,7 @@ page_splice_t::page_splice_t(
     uint                 len_,
     const void*         tuple,
     const cvec_t&         v)
-    : idx(i), start(start_), 
+    : idx(i), start(start_),
       old_len(len_), new_len(v.size())
 {
     w_assert1((size_t)(old_len + new_len) < sizeof(data));
@@ -1271,7 +1271,7 @@ page_splice_t::page_splice_t(
 page_splice_log::page_splice_log(
     const page_p&         page,
     int                 idx,
-    int                 start, 
+    int                 start,
     int                 len,
     const cvec_t&         v)
 {
@@ -1281,7 +1281,7 @@ page_splice_log::page_splice_log(
                                     page.tuple_addr(idx), v))->size());
 }
 
-void 
+void
 page_splice_log::redo(page_p* page)
 {
     page_splice_t* dp = (page_splice_t*) _data;
@@ -1292,8 +1292,8 @@ page_splice_log::redo(page_p* page)
         u_char *old = (u_char *)dp->old_image();
         u_char *tuple = (u_char *)p;
         int len = dp->old_len;
-        fprintf(stderr, 
-            "Comparison of len %d starts with old image at addr %p,and tuple+start(%d) @ %p\n", 
+        fprintf(stderr,
+            "Comparison of len %d starts with old image at addr %p,and tuple+start(%d) @ %p\n",
                 len,
                 old, dp->start, p);
         // Tell where it starts to go wrong.
@@ -1308,7 +1308,7 @@ page_splice_log::redo(page_p* page)
         }
     }
     w_assert1(memcmp(dp->old_image(), p, dp->old_len) == 0);
-#endif 
+#endif
 
     const vec_t new_vec_tmp(dp->new_image(), dp->new_len);
     W_COERCE(page->splice(dp->idx, dp->start, dp->old_len, new_vec_tmp));
@@ -1329,7 +1329,7 @@ page_splice_log::undo(page_p* page)
     }
     w_assert1(dp->new_len <= smlevel_0::page_sz);
     w_assert1(dp->old_len <= smlevel_0::page_sz);
-#endif 
+#endif
 
     const vec_t old_vec_tmp(dp->old_image(), dp->old_len);
     W_COERCE(page->splice(dp->idx, dp->start, dp->new_len, old_vec_tmp));
@@ -1356,17 +1356,17 @@ struct page_splicez_t {
     char                 data[logrec_t::data_sz - 6 * sizeof(int2_t)]; // old data & new data
 
     NORET                page_splicez_t(
-        int                     i, 
-        uint                     start, 
-        uint                     len, 
-        uint                     olen_, 
+        int                     i,
+        uint                     start,
+        uint                     len,
+        uint                     olen_,
         uint                     nlen_,
         const void*             tuple,
         const cvec_t&             v);
     void*                 old_image()   { return data; }
     void*                 new_image()   { return data + olen; }
-    int                        size()  { 
-        return data + olen + nlen - (char*) this; 
+    int                        size()  {
+        return data + olen + nlen - (char*) this;
     }
 };
 page_splicez_t::page_splicez_t(
@@ -1377,7 +1377,7 @@ page_splicez_t::page_splicez_t(
     uint                 zlen,
     const void*         tuple,
     const cvec_t&         v)
-    : idx(i), start(start_), old_len(len_), 
+    : idx(i), start(start_), old_len(len_),
     olen(save_),
     new_len(v.size()),
     nlen(zlen)
@@ -1394,7 +1394,7 @@ page_splicez_t::page_splicez_t(
         v.copy_to(new_image());
     }
 
-    DBG(<<"splicez log: " 
+    DBG(<<"splicez log: "
         << " olen: " << olen
         << " old_len: " << old_len
         << " new_len: " << new_len
@@ -1404,7 +1404,7 @@ page_splicez_t::page_splicez_t(
 page_splicez_log::page_splicez_log(
     const page_p&         page,
     int                 idx,
-    int                 start, 
+    int                 start,
     int                 len,
     int                 olen,
     int                 nlen,
@@ -1416,7 +1416,7 @@ page_splicez_log::page_splicez_log(
                                     page.tuple_addr(idx), v))->size());
 }
 
-void 
+void
 page_splicez_log::redo(page_p* page)
 {
     page_splicez_t* dp = (page_splicez_t*) _data;
@@ -1438,7 +1438,7 @@ page_splicez_log::redo(page_p* page)
         // saved neither image, both were zeroes
 
 
-        if(dp->old_len > 0) { 
+        if(dp->old_len > 0) {
             // there was an old image to consider saving
             if(dp->olen == 0) {
                 // the old image was zeroes so we didn't bother saving it.
@@ -1450,7 +1450,7 @@ page_splicez_log::redo(page_p* page)
             }
         } // else nothing to compare, since old len is 0 (it was an insert)
     }
-#endif 
+#endif
     vec_t z;
 
     if(dp->nlen == 0) {
@@ -1494,7 +1494,7 @@ page_splicez_log::undo(page_p* page)
             w_assert1(memcmp(dp->new_image(), p, dp->new_len) == 0);
         }
     }
-#endif 
+#endif
     DBG(<<"splicez undo: "
         << " olen (stored) : " << dp->olen
         << " old_len (orig): " << dp->old_len
@@ -1525,20 +1525,20 @@ struct page_set_byte_t {
     u_char        old_value;
     u_char        bits;
     int                operation;
-    NORET        page_set_byte_t(uint2_t i, u_char old, u_char oper, int op) : 
+    NORET        page_set_byte_t(uint2_t i, u_char old, u_char oper, int op) :
         idx(i), old_value(old), bits(oper), operation(op) {};
     int                size()   { return sizeof(*this); }
 };
 
-page_set_byte_log::page_set_byte_log(const page_p& page, int idx, 
+page_set_byte_log::page_set_byte_log(const page_p& page, int idx,
         u_char what, u_char bits, int op)
-{    
+{
     w_assert2(page.tag() == page_p::t_extlink_p);
     fill(&page.pid(), page.tag(),
                 (new (_data) page_set_byte_t(idx, what, bits, op))->size());
 }
 
-void 
+void
 page_set_byte_log::undo(page_p* page)
 {
     page_set_byte_t* dp = (page_set_byte_t*) _data;
@@ -1546,7 +1546,7 @@ page_set_byte_log::undo(page_p* page)
     W_COERCE( page->set_byte(dp->idx, dp->old_value, page_p::l_set) );
 }
 
-void 
+void
 page_set_byte_log::redo(page_p* page)
 {
     page_set_byte_t* dp = (page_set_byte_t*) _data;
@@ -1580,11 +1580,14 @@ page_image_log::page_image_log(const page_p& page)
     fill(&page.pid(), page.tag(), (new (_data) page_image_t(page))->size());
 }
 
-void 
+void
 page_image_log::redo(page_p* page)
 {
     page_image_t* dp = (page_image_t*) _data;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
     memcpy(&page->persistent_part(), dp->image, sizeof(dp->image));
+#pragma GCC diagnostic pop
 }
 
 
@@ -1635,17 +1638,17 @@ btree_purge_log::redo(page_p* page)
      * The freeing-of-pages part was redone by the
      * log records for those operations.  All we have
      * to redo is the change to the root page and the
-     * store flags 
+     * store flags
      */
     btree_p* bp = (btree_p*) page;
     btree_purge_t* dp = (btree_purge_t*) _data;
-    W_COERCE( bp->set_hdr(dp->root.page, 1, 0, 
-        (uint2_t)(bp->is_compressed()? 
+    W_COERCE( bp->set_hdr(dp->root.page, 1, 0,
+        (uint2_t)(bp->is_compressed()?
         btree_p::t_compressed: btree_p::t_none)) );
 
     /*
      *  Xct for which this is done could have finished,
-     *  but that's ok.  In recovery, we don't need to 
+     *  but that's ok.  In recovery, we don't need to
      *  attach the xct because there will be log records
      *  (to be redone) that re-set the store flags as
      *  required.
@@ -1678,9 +1681,9 @@ struct btree_insert_t {
 };
 
 btree_insert_t::btree_insert_t(
-    const btree_p&         _page, 
+    const btree_p&         _page,
     int                 _idx,
-    const cvec_t&         key, 
+    const cvec_t&         key,
     const cvec_t&         el,
     bool                 uni)
     : idx(_idx), klen(key.size()), elen(el.size()), unique(uni)

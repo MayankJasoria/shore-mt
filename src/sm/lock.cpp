@@ -450,7 +450,7 @@ lock_m::_lock(
             }
             // DROP THROUGH to WAIT_SPECIFIED_BY_THREAD ...
             // (whose default is WAIT_FOREVER)
-
+            /* fallthrough */
         case WAIT_SPECIFIED_BY_THREAD:
             timeout = me()->lock_timeout();
             break;

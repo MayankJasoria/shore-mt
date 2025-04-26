@@ -3247,7 +3247,10 @@ xct_t::rollback(const lsn_t &save_pt)
              /* Only copy the valid portion of 
               * the log record, then release it 
               */
-             memcpy(__copy__buf, &temp, temp.length());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+            memcpy(__copy__buf, &temp, temp.length()); // Warning points here
+#pragma GCC diagnostic pop
              log->release();
         }
 

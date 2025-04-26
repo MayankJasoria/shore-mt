@@ -1825,7 +1825,7 @@ page_p::splice(slotid_t idx, slot_length_t start, slot_length_t len, const cvec_
                 /*
                  *  last slot --- we can simply extend it 
                  */
-            } else if (contig_space() > align(s.length + need)) {
+            } else if (contig_space() > (smsize_t) align(s.length + need)) {
                 /*
                  *  copy this record to the end and expand from there
                  */
@@ -2428,11 +2428,12 @@ bool page_check_enabled = true; // see vol.cpp
 rc_t
 page_p::check()
 {
-  // Volume formats request that we not check pages while they're at
-  // work. IF that causes a problem, remove this check.
-  if(!page_check_enabled)
-    return RCOK;
-  
+    // Volume formats request that we not check pages while they're at
+    // work. IF that causes a problem, remove this check.
+    if(!page_check_enabled) {
+        return RCOK;
+    }
+
     /*
      *  Map area Each Byte in map corresponds
      *  to a byte in the page.
@@ -2443,7 +2444,7 @@ page_p::check()
      *  Zero out map
      */
     memset(map, 0, SM_PAGESIZE);
-    
+
     /*
      *  Compute our own end and nfree counters. Mark all used bytes
      *  to make sure that the tuples in page do not overlap.
@@ -2468,11 +2469,11 @@ page_p::check()
      */
     w_assert1(END <= _pp->end);
     w_assert1(_pp->space.nfree() == NFREE);
-    w_assert1(_pp->end <= page_s::slot_offset_t(data_sz + 2 * sizeof(slot_t) - 
+    w_assert1(_pp->end <= page_s::slot_offset_t(data_sz + 2 * sizeof(slot_t) -
                            sizeof(slot_t) * _pp->nslots));
 
     /*
-     *  Done 
+     *  Done
      */
     //    mutex.release();
 

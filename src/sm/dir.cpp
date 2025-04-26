@@ -240,7 +240,10 @@ dir_vol_m::_destroy_temps(vid_t vid)
         while ( (!(rc = bt->fetch(cursor)).is_error()) && cursor.key())  {
             w_assert1(cursor.klen() == sizeof(snum_t));
             memcpy(&curr_key[j], cursor.key(), cursor.klen());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
             memcpy(&curr_value[j], cursor.elem(), cursor.elen());
+#pragma GCC diagnostic pop
 
             stid_t s(vid, curr_key[j]);
 

@@ -67,11 +67,11 @@ Rome Research Laboratory Contract No. F30602-97-2-0247.
  *  constants for w_base_t                                      *
  *--------------------------------------------------------------*/
 const w_base_t::int1_t    w_base_t::int1_max  = 0x7f;
-const w_base_t::int1_t    w_base_t::int1_min  = (const w_base_t::int1_t) 0x80u;
+const w_base_t::int1_t    w_base_t::int1_min  = (w_base_t::int1_t) 0x80u;
 const w_base_t::uint1_t   w_base_t::uint1_max = 0xff;
 const w_base_t::uint1_t   w_base_t::uint1_min = 0x0;
 const w_base_t::int2_t    w_base_t::int2_max  = 0x7fff;
-const w_base_t::int2_t    w_base_t::int2_min  = (const w_base_t::int2_t) 0x8000u;
+const w_base_t::int2_t    w_base_t::int2_min  = (w_base_t::int2_t) 0x8000u;
 const w_base_t::uint2_t   w_base_t::uint2_max = 0xffff;
 const w_base_t::uint2_t   w_base_t::uint2_min = 0x0;
 const w_base_t::int4_t    w_base_t::int4_max  = 0x7fffffff;

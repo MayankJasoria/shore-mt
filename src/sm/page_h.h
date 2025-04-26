@@ -209,6 +209,8 @@ public:
             _space_left(other._space_left), 
             _pgid(other._pgid) { }
 
+    pginfo_t& operator=(const pginfo_t& other) = default;
+
     NORET     ~pginfo_t() { }
 
     smsize_t  space() const { return _space_left; }

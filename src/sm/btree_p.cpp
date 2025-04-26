@@ -91,6 +91,7 @@ btree_p::distribute(
     int     factor,        // I-  % that should remain
     const bool bIgnoreLatches)
 {
+    (void) bIgnoreLatches;
     w_assert3(is_fixed());
     w_assert3(rsib.is_fixed());
     w_assert3(latch_mode() == LATCH_EX || latch_mode() == LATCH_NLX);

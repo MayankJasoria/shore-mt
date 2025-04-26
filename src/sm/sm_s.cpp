@@ -184,6 +184,7 @@ w_rc_t key_type_s::parse_key_type(
 		case key_type_s::U: // unsigned compressed
 			kc[j].compressed = true;
 			// drop down
+                	/* fallthrough */
 		case key_type_s::i:
 		case key_type_s::u:
 			if ( (kc[j].length != 1 
@@ -197,6 +198,7 @@ w_rc_t key_type_s::parse_key_type(
 		case key_type_s::F: // float compressed
 			kc[j].compressed = true;
 			// drop down
+                	/* fallthrough */
 		case key_type_s::f:
 			if ((kc[j].length != 4 && kc[j].length != 8) 
 										   || kc[j].variable)
@@ -206,6 +208,7 @@ w_rc_t key_type_s::parse_key_type(
 		case key_type_s::B: // uninterpreted bytes, compressed
 			kc[j].compressed = true;
 			// drop down
+                	/* fallthrough */
 		case key_type_s::b: // uninterpreted bytes
 			w_assert3(kc[j].length > 0);
 			break;

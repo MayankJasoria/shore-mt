@@ -3250,7 +3250,7 @@ bool bf_filter_sweep_old_t::is_good(const bfcb_t& p) const
 {
     if( p.pid()._stid.vol != _vol)       return false;
     if( ! p.pid().page)                  return false;
-    if( ! p.curr_rec_lsn().hi() == _segment ) return false;
+    if( (!p.curr_rec_lsn().hi()) == _segment ) return false;
 
     if( p.hotbit() ) {
         // skip hot pages even if they are dirty.

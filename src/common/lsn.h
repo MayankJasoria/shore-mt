@@ -250,10 +250,19 @@ public:
     lsn_t(w_base_t::uint4_t f, sm_diskaddr_t r) : 
                 _data(from_file(f) | from_rba(r)) { }
 
-    // copy operator
+    // copy constructor
     lsn_t(const lsn_t & other) : _data(other._data) { }
 
-    bool valid()             const { 
+    // Explicitly define the copy assignment operator
+    lsn_t& operator=(const lsn_t& other) {
+        if (this != &other) { // Protect against self-assignment
+            _data = other._data;
+        }
+        return *this;
+    }
+
+
+    bool valid()             const {
                                     // valid is essentially iff file != 0
 #if W_DEBUG_LEVEL > 2
                                     bool first = _data > mask();

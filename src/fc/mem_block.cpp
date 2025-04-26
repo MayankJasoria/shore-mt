@@ -230,7 +230,8 @@ void* block_list::acquire(size_t chip_size, size_t chip_count, size_t block_size
     return _slow_acquire(TEMPLATE_ARGS);
 }
 
-
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreorder"
 block_list::block_list(block_pool* pool, size_t chip_size, size_t chip_count, size_t block_size)
     : _fake_block(TEMPLATE_ARGS)
     , _tail(&_fake_block)
@@ -251,7 +252,7 @@ block_list::block_list(block_pool* pool, size_t chip_size, size_t chip_count, si
     _fake_block._bits._usable_chips = 0;
     _fake_block._bits._zombie_chips = 0;
 }
-
+#pragma GCC diagnostic pop
 
 void* block_list::_slow_acquire(size_t chip_size, size_t chip_count, size_t block_size)
 {

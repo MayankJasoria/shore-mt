@@ -1023,6 +1023,18 @@ public:
         }
     }
     void marshal_sortkeys(factory_t& fact);
+
+    void load_persistent_part(const char* buffer, size_t size) {
+        // This method is inside meta_header_t, so it can access private members
+
+        // Warning might still occur here because __persistent_part is of type _persistent,
+        // which is also non-trivial (due to its constructor).
+        // Apply pragmas here if the warning persists on this memcpy.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+        memcpy(&__persistent_part, buffer, size); // Now this memcpy is legal
+#pragma GCC diagnostic pop
+    }
     //*********************************************************
     // END persistent part
     //*********************************************************
@@ -3202,8 +3214,7 @@ tape_t::prime_record(
     W_DO(metafp().get_rec(slot, rec));
     w_assert3(rec->hdr_size() <= sizeof(meta_header_t));
     w_assert3(_meta); w_assert3(rec->hdr());
-    memcpy(_meta, rec->hdr(), rec->hdr_size());
-    w_assert3(rec->hdr_size() == _meta->persistent_size());
+    _meta->load_persistent_part(rec->hdr(), rec->hdr_size());
 
     DBG(<<"prime_record: got metadata for ordinal=" << _meta->ordinal());
 

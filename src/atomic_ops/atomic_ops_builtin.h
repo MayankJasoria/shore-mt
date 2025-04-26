@@ -92,7 +92,7 @@ static inline void atomic_add_int(volatile uint_t *ptr, int val) {
     __sync_add_and_fetch(ptr, val);
 }
 static inline void atomic_add_ptr(volatile void *ptr, ssize_t val) {
-    (void)__sync_add_and_fetch((char ** volatile)ptr, val);
+    (void)__sync_add_and_fetch((char **)ptr, val);
 }
 static inline void atomic_add_long(volatile ulong_t *ptr, long val) {
     __sync_add_and_fetch(ptr, val);
@@ -253,7 +253,7 @@ static inline uint_t atomic_add_int_nv(volatile uint_t *ptr, int val) {
     return __sync_add_and_fetch(ptr, val);
 }
 static inline void *atomic_add_ptr_nv(volatile void *ptr, ssize_t val) {
-    return __sync_add_and_fetch((char ** volatile)ptr, val);
+    return __sync_add_and_fetch((char **)ptr, val);
 }
 static inline ulong_t atomic_add_long_nv(volatile ulong_t *ptr, long val) {
     return __sync_add_and_fetch(ptr, val);
@@ -346,7 +346,7 @@ static inline uint_t atomic_cas_uint(volatile uint_t *ptr, uint_t ov, uint_t nv)
     return __sync_val_compare_and_swap(ptr, ov, nv);
 }
 static inline void *atomic_cas_ptr(volatile void *ptr, void * ov, void * nv) {
-    return __sync_val_compare_and_swap((char ** volatile)ptr, ov, nv);
+    return __sync_val_compare_and_swap((char **)ptr, ov, nv);
 }
 static inline ulong_t atomic_cas_ulong(volatile ulong_t *ptr, ulong_t ov, ulong_t nv) {
     return __sync_val_compare_and_swap(ptr, ov, nv);
@@ -379,7 +379,7 @@ static inline uint_t atomic_swap_uint(volatile uint_t *ptr, uint_t val) {
     return __sync_lock_test_and_set(ptr, val);
 }
 static inline void *atomic_swap_ptr(volatile void *ptr, void * val) {
-    return __sync_lock_test_and_set((char ** volatile)ptr, val);
+    return __sync_lock_test_and_set((char **)ptr, val);
 }
 static inline ulong_t atomic_swap_ulong(volatile ulong_t *ptr, ulong_t val) {
     return __sync_lock_test_and_set(ptr, val);

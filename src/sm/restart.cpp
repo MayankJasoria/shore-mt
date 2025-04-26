@@ -695,7 +695,15 @@ restart_m::analysis_pass(
         logrec_t& r = *log_rec_buf;
 
         /* Only copy the valid portion of the log record. */
+        // Warning: 'void* memcpy(...)' writing to non-trivially copyable type 'class logrec_t' [-Wclass-memaccess]
+        // Reason: logrec_t is non-trivial (constructor, variable payload handling).
+        // Intent: Create a size-dependent binary copy of the log record (header + r.length() payload).
+        // Standard copy would copy the full fixed-size buffer, which is incorrect.
+        // memcpy is necessary for this length-aware binary copy.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
         memcpy(__copy__buf, &r, r.length());
+#pragma GCC diagnostic pop
         log->release();
 
         DBG( << theLastMountLSNBeforeChkpt << ": " << copy );

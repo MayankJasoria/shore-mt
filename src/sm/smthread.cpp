@@ -223,7 +223,7 @@ smthread_t::tcb_t::clear_TL_stats()
 {
     // Global stats are protected by a mutex 
     smlevel_0::add_to_global_stats(TL_stats()); // before clearing them
-    memset(&TL_stats(),0, sizeof(sm_stats_info_t)); 
+    TL_stats().clear();
 }
 
 /* Non-thread-safe add from the per-thread copy to another struct.

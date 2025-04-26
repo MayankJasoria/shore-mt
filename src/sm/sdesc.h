@@ -138,9 +138,13 @@ public:
         w_assert1(nkc < (sizeof(kc) / sizeof(kc[0])));
         memcpy(kc, kc_, (unsigned int)(sizeof(key_type_s) * nkc)); 
         if (nkc < sizeof(kc)) {
-            memset(kc+nkc, 0, sizeof(kc)-nkc);
+            for (w_base_t::uint4_t i = nkc; i < sizeof(kc) / sizeof(kc[0]); i++) {
+                kc[i] = key_type_s();
+            }
         }
     }
+
+    sinfo_s(const sinfo_s& other) = default;
 
     sinfo_s& operator=(const sinfo_s& other) {
         store = other.store; 

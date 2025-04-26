@@ -356,8 +356,13 @@ void format_unix_error(int err, char *buf, int bufsize)
 #else
     char    *s = "No strerror function. Cannot format unix error.";
 #endif
-    strncpy(buf, s, bufsize);
-    buf[bufsize-1] = '\0';
+    // Replace strncpy with safer alternative
+    if (bufsize > 0) {
+        size_t len = strlen(s);
+        size_t copy_len = (len < static_cast<size_t>(bufsize - 1)) ? len : static_cast<size_t>(bufsize - 1);
+        memcpy(buf, s, copy_len);
+        buf[copy_len] = '\0';
+    }
 }
 
 ostream& w_error_t::print_error(ostream &o) const

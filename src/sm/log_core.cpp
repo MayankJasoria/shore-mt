@@ -1236,7 +1236,8 @@ log_core::log_core(
             w_auto_delete_array_t<char>  cleanup(name);
 
             memset(name, '\0', namelen+1);
-            strncpy(name, d, orig_namelen);
+            strncpy(name, d, namelen);
+            name[namelen] = '\0';
             DBGTHRD(<<"name= " << name);
 
             bool parse_ok = (strncmp(name,master_prefix(),strlen(master_prefix()))==0);
@@ -1292,10 +1293,14 @@ log_core::log_core(
         w_auto_delete_array_t<char>  cleanup(name);
 
         memset(name, '\0', namelen+1);
-        strncpy(name, dn, orig_namelen);
+        strncpy(name, dn, namelen);
+        name[namelen] = '\0';
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
         strncpy(buf, name, prefix_len);
         buf[prefix_len] = '\0';
+#pragma GCC diagnostic pop
 
         DBGTHRD(<<"name= " << name);
 
@@ -1606,7 +1611,13 @@ log_core::log_core(
 
         {
             DBGTHRD(<<"explicit truncating " << fname << " to " << pos);
-            os_truncate(fname, pos );
+            int res = os_truncate(fname, pos );
+            if (res < 0) {
+              w_rc_t e = RC(fcOS);
+                smlevel_0::errlog->clog  << fatal_prio
+                    << "truncate(" << fname << "):" << endl << e << endl;
+                W_COERCE(e);
+            }
 
             //
             // but we can't just use truncate() --

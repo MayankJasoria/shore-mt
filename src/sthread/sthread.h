@@ -1137,28 +1137,67 @@ sthread_t::status() const
 // Need string.h to get strerror_r 
 #include <string.h>
 
+/*
+ * Helper macro to handle strerror_r and format the error message.
+ * Takes the function call directly, assigns its result to res, and then
+ * encapsulates the logic for choosing between the buffer and the returned pointer.
+ */
+#define DO_PTHREAD_ERROR_MSG(x_call) \
+{ \
+    int res = x_call; /* Assign the result of the function call to res here */ \
+    w_ostrstream S; \
+    S << "Unexpected result from " << #x_call << " " << res << " "; \
+\
+    char buf[100]; \
+    /* Use a pattern unlikely to be an error message prefix */ \
+    const char pattern[] = "BUFFER_UNTouched"; \
+    memset(buf, 0, sizeof(buf)); /* Initialize with zeros first */ \
+    strncpy(buf, pattern, sizeof(buf) - 1); /* Fill with pattern */ \
+    buf[sizeof(buf) - 1] = '\0'; /* Ensure pattern is null-terminated */ \
+\
+    /* Call strerror_r. Cast the result to const char*. */ \
+    /* Note: Casting the POSIX int return to const char* is potentially unsafe, */ \
+    /* but necessary to perform the pointer checks below. This is a limitation */ \
+    /* when trying to handle both signatures portably within a simple macro. */ \
+    const char* err_str_ptr = (const char*) strerror_r(res, buf, sizeof(buf)); \
+\
+    /* Check if buf was modified by comparing against the pattern. */ \
+    /* We compare the pattern length to avoid issues if the error message */ \
+    /* is exactly the pattern length but different content. */ \
+    bool buf_was_modified = (strncmp(buf, pattern, sizeof(pattern) - 1) != 0); \
+\
+    /* Determine which string to use: */ \
+    /* 1. If the returned pointer is non-NULL AND not the buffer itself, */ \
+    /* AND the buffer was NOT modified, assume it's the GNU static string. */ \
+    if (err_str_ptr != NULL && err_str_ptr != buf && !buf_was_modified) { \
+        S << err_str_ptr << ends; \
+    } else { \
+        /* 2. Otherwise, use the buffer content. This covers: */ \
+        /* - POSIX version (always writes to buf, returns int) */ \
+        /* - GNU version that writes to buf and returns buf */ \
+        /* - GNU version that returns NULL (if that happens on error) */ \
+        /* - Fallback if the logic above fails to identify the static string case */ \
+        /* Ensure buf is null-terminated before streaming */ \
+        buf[sizeof(buf) - 1] = '\0'; \
+        S << buf << ends; \
+    } \
+    W_FATAL_MSG(fcINTERNAL, << S.c_str()); \
+}
+
 #define DO_PTHREAD_BARRIER(x) \
-{   int res = x; \
+{   int res = x; /* Keep res here to check against PTHREAD_BARRIER_SERIAL_THREAD */ \
     if(res && res != PTHREAD_BARRIER_SERIAL_THREAD) { \
-       w_ostrstream S; \
-       S << "Unexpected result from " << #x << " " << res << " "; \
-       char buf[100]; \
-       (void) strerror_r(res, &buf[0], sizeof(buf)); \
-       S << buf << ends; \
-       W_FATAL_MSG(fcINTERNAL, << S.c_str()); \
+       DO_PTHREAD_ERROR_MSG(x); /* Pass the function call directly */ \
     }  \
 }
+
 #define DO_PTHREAD(x) \
-{   int res = x; \
+{   int res = x; /* Keep res here for the if check */ \
     if(res) { \
-       w_ostrstream S; \
-       S << "Unexpected result from " << #x << " " << res << " "; \
-       char buf[100]; \
-       (void) strerror_r(res, &buf[0], sizeof(buf)); \
-       S << buf << ends; \
-       W_FATAL_MSG(fcINTERNAL, << S.c_str()); \
+       DO_PTHREAD_ERROR_MSG(x); /* Pass the function call directly */ \
     }  \
 }
+
 #define DO_PTHREAD_TIMED(x) \
 {   int res = x; \
     if(res && res != ETIMEDOUT) { \
@@ -1170,3 +1209,4 @@ sthread_t::status() const
 /*<std-footer incl-file-exclusion='STHREAD_H'>  -- do not edit anything below this line -- */
 
 #endif          /*</std-footer>*/
+

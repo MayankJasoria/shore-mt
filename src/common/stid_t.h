@@ -89,6 +89,8 @@ struct stid_t {
     bool operator!=(const stid_t& s) const;
     bool operator<(const stid_t& s) const;
 
+    stid_t& operator=(const stid_t& s); // Explicitly define the copy assignment operator
+
     friend ostream& operator<<(ostream&, const stid_t& s);
     friend istream& operator>>(istream&, stid_t& s);
 
@@ -104,6 +106,14 @@ inline stid_t::stid_t() : vol(0), store(0)
 
 inline stid_t::stid_t(vid_t v, snum_t s) : vol(v), store(s)
 {}
+
+inline stid_t& stid_t::operator=(const stid_t& s) {
+    if (this != &s) {
+        vol = s.vol;
+        store = s.store;
+    }
+    return *this;
+}
 
 inline stid_t::operator const void*() const
 {

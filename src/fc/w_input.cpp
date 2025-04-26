@@ -300,35 +300,39 @@ w_base_t::_scan_uint8(
     // Get the base from the stream
     ios_fmtflags old = i.flags();
     skip_white = ((old & ios::skipws) != 0);
-    switch(old & ios::basefield) {
-        case 0:
+
+    // Fix: Handle the default base (0) case explicitly before the switch
+    ios_fmtflags basefield_flags = old & ios::basefield;
+    if (basefield_flags == 0) {
         base = 0;
         table = &table_unknown;
-        break;
+    } else {
+        switch(basefield_flags) {
+            case ios::hex:
+            base = 4; // shift by this
+            table = &table_base16;
+            thresh = is_signed?  thresh_hex_signed : thresh_hex_unsigned;
+            break;
 
-        case ios::hex:
-        base = 4; // shift by this
-        table = &table_base16;
-        thresh = is_signed?  thresh_hex_signed : thresh_hex_unsigned;
-        break;
+            case ios::oct:
+            base = 3; // shift by this
+            table = &table_base8;
+            thresh = is_signed?  thresh_oct_signed : thresh_oct_unsigned;
+            break;
 
-        case ios::oct:
-        base = 3; // shift by this
-        table = &table_base8;
-        thresh = is_signed?  thresh_oct_signed : thresh_oct_unsigned;
-        break;
-
-        case ios::dec:
-        base = 10; // multiply by this
-        table = &table_base10;
-        thresh = is_signed?  thresh_dec_signed : thresh_dec_unsigned;
-        thresh2 = is_signed?  thresh2_dec_signed : thresh2_dec_unsigned;
-        thresh3 = is_signed?  (negate? 8: 7) : 5;
-        thresh4 = is_signed? thresh_hex_signed : thresh_hex_unsigned;
-        break;
-        default:
-        W_FATAL(fcINTERNAL);
-        break;
+            case ios::dec:
+            base = 10; // multiply by this
+            table = &table_base10;
+            thresh = is_signed?  thresh_dec_signed : thresh_dec_unsigned;
+            thresh2 = is_signed?  thresh2_dec_signed : thresh2_dec_unsigned;
+            thresh3 = is_signed?  (negate? 8: 7) : 5;
+            thresh4 = is_signed? thresh_hex_signed : thresh_hex_unsigned;
+            break;
+            default:
+            // This should not be reached if basefield_flags is one of the standard bases
+            W_FATAL(fcINTERNAL);
+            break;
+        }
     }
     }
 

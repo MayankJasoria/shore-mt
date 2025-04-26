@@ -832,7 +832,7 @@ sort_stream_i::remove_duplicates()
                             break;
                         if (rlen>0 && memcmp(k->rec, _r->body(), (int)rlen))
                             break;
-                            pos++;
+                        pos++;
                     } else { break; }
                 }
             }
@@ -1114,7 +1114,10 @@ sort_stream_i::flush_run()
         rid_t* tmp = new rid_t[sd->max_list_sz<<1]; // deleted in ~sort_desc_t
         record_malloc(tmp, (sd->max_list_sz << 1)*sizeof(rid_t));
 
-        memcpy(tmp, sd->run_list, sd->run_count*sizeof(rid));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+        memcpy(tmp, sd->run_list, sd->run_count*sizeof(rid_t)); // Fix: Use rid_t for sizeof
+#pragma GCC diagnostic pop
         INC_TSTAT_SORT(sort_memcpy_cnt);
         ADD_TSTAT_SORT(sort_memcpy_bytes, sd->run_count * sizeof(rid));
 
@@ -1218,7 +1221,10 @@ sort_stream_i::merge(bool skip_last_pass=false)
         if (skip_last_pass && last_pass) {
             if (sd->run_list != in_list) {
                 // switched, we need to copy the out list
-                memcpy(sd->run_list, in_list, (int)in_list_cnt*sizeof(rid_t));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+                memcpy(sd->run_list, in_list, (int)in_list_cnt*sizeof(rid_t)); // Warning 3 points here
+#pragma GCC diagnostic pop
                 INC_TSTAT_SORT(sort_memcpy_cnt);
                 ADD_TSTAT_SORT(sort_memcpy_bytes, int(in_list_cnt * sizeof(rid_t)));
             }

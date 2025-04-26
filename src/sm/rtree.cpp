@@ -2897,7 +2897,7 @@ rtree_m::bulk_load(
     const rtld_desc_t& desc,        // I- load descriptor
     rtree_stats_t& stats)        // O- index stats
 {
-    memset(&stats, 0, sizeof(stats));
+    stats.clear();
     if (!is_empty(root)) {
          return RC(eNDXNOTEMPTY);
     }

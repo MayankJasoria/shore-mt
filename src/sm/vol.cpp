@@ -198,7 +198,13 @@ extlink_p::format(
     extlink_t* links = new extlink_t[max];
     w_auto_delete_array_t<extlink_t> auto_del(links);
 
-    memset(links, 0, max * sizeof(extlink_t) );
+    for (int i = 0; i < max; ++i) {
+        links[i].clrall(); // This calls pmap.clear_all()
+        links[i].next = 0;
+        links[i].prev = 0;
+        links[i].owner = 0;
+        links[i].pbucketmap = 0; // Set to 0, overriding the constructor's uint4_max
+    }
     vec_t vec;
     vec.put(links, max * sizeof(extlink_t));
 
@@ -226,9 +232,8 @@ stnode_p::format(const lpid_t& pid, tag_t tag,
 {
     w_assert9(tag == t_stnode_p);
         
-    stnode_t* stnode = new stnode_t[max];
+    stnode_t* stnode = new stnode_t[max]();
     w_auto_delete_array_t<stnode_t> auto_del(stnode);
-    memset(stnode, 0, max * sizeof(stnode_t));
 
     vec_t vec;
     vec.put(stnode, max * sizeof(stnode_t));
@@ -4074,14 +4079,20 @@ vol_t::read_page(shpid_t pnum, page_s& page)
      * disk, nothing changes the color of the page back to "initialized",
      * and you suddenly see UMR or UMC errors from valid buffer pool pages.
      */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
     memset(&page, '\0', sizeof(page));
+#pragma GCC diagnostic pop
 #endif
     long start = gethrtime();
         /* XXX return errors to caller */
     w_rc_t err = t->pread(_unix_fd, (char *) &page, sizeof(page), offset);
     if(err.err_num() == sthread_t::stSHORTIO && err.sys_err_num() == 0) {
       // read past end of OS file. return all zeros
-      memset(&page, 0, sizeof(page));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+        memset(&page, 0, sizeof(page));
+#pragma GCC diagnostic pop;
     } else {
       W_COERCE_MSG(err, << "volume id=" << vid()
               << " err_num " << err.err_num()

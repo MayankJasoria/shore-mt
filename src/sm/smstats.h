@@ -159,9 +159,15 @@ public:
         bfht.compute(); 
         sm.compute(); 
     }
+
+    void clear() {
+        bfht = bf_htab_stats_t();
+        sm = sm_stats_t();
+    }
+
     friend ostream& operator<<(ostream&, const sm_stats_info_t& s);
     sm_stats_info_t() {
-        memset(this, '\0', sizeof (*this));
+        clear();
     }
 };
 
